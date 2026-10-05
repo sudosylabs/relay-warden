@@ -25,6 +25,9 @@ IP. Failed authentication returns `401`, failed CSRF/origin checks `403`.
 
 ## Endpoints
 
+Set `TOKEN` from your admin token file and `ENDPOINT_ID` to the public ID
+you want to manage. Never use a private key as an endpoint ID.
+
 ```bash
 # List (approved and revoked) with live connection counts and limits
 curl -H "Authorization: Bearer $TOKEN" \
@@ -32,18 +35,18 @@ curl -H "Authorization: Bearer $TOKEN" \
 
 # Approve (create) — endpoint IDs are public keys, hex or base32;
 # only the canonical form is stored
-curl -X PUT http://127.0.0.1:8081/admin/endpoints/<ENDPOINT_ID> \
+curl -X PUT "http://127.0.0.1:8081/admin/endpoints/$ENDPOINT_ID" \
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   -d '{"label": "sensor 3", "approved": true}'
 
 # Edit — updates require the current `revision` (409 on conflict);
 # omitted rate fields are kept, explicit null clears them
-curl -X PUT http://127.0.0.1:8081/admin/endpoints/<ENDPOINT_ID> \
+curl -X PUT "http://127.0.0.1:8081/admin/endpoints/$ENDPOINT_ID" \
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   -d '{"revision": 1, "speed_policy": "custom", "custom_rx_bps": 50000}'
 
 # Revoke — denies immediately and disconnects live connections
-curl -X POST http://127.0.0.1:8081/admin/endpoints/<ENDPOINT_ID>/revoke \
+curl -X POST "http://127.0.0.1:8081/admin/endpoints/$ENDPOINT_ID/revoke" \
   -H "Authorization: Bearer $TOKEN"
 ```
 

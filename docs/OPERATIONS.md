@@ -7,7 +7,7 @@ maintenance window; the rollback section below is part of that plan.
 ## Layout (operator-chosen paths)
 
 - Binary: `/opt/relay-warden/relay-warden`
-- Config: `/etc/relay-warden/warden.toml` (see `config.production.example.toml`)
+- Config: `/etc/relay-warden/warden.toml` (see the production example shipped in the archive)
 - State dir: `/var/lib/relay-warden/` (`warden.db`, `admin.token` 0600)
 - Service: `deploy/relay-warden.service` (example unit)
 
@@ -17,6 +17,9 @@ Supported host: 64-bit Linux (x86-64 or ARM64) with glibc 2.39 or newer
 (Ubuntu 24.04 or equivalent). The release binaries are dynamically linked
 against the build runner's glibc — they do not run on musl-based or older
 systems; check `ldd --version` before installing elsewhere.
+
+For complete copy-and-run installation commands, use the archive's `INSTALL.md`
+or the [installation guide](INSTALL.md) in the source tree.
 
 1. Create the user and directories:
    `useradd -r -s /usr/sbin/nologin relay-warden`
@@ -36,11 +39,15 @@ systems; check `ldd --version` before installing elsewhere.
 
 ## Reverse proxy
 
-Forward only the relay paths to the loopback backend; keep everything else
+Forward `/relay` (transport) and `/ping` (latency probe) to the loopback backend; keep everything else
 for existing services. Preserve WebSocket upgrades and the
 `Sec-WebSocket-Protocol` subprotocol (`iroh-relay-v1/v2`) plus the
 `X-Iroh-Relay-Client-Auth-V1` header. Do not buffer relay WebSockets.
 Examples: `deploy/caddy.example`, `deploy/nginx.example`.
+The Caddy example uses automatic HTTPS. The Nginx example needs an existing
+certificate and must be placed in the correct `http` context. Validate your
+edited proxy configuration before restarting it; these snippets are not a
+substitute for a public HTTPS/client compatibility test.
 Never route `/admin` or `/metrics` through the public edge: the admin
 listener stays loopback-only (SSH tunnel for remote access) precisely so a
 proxy misconfiguration cannot expose administration.
@@ -62,7 +69,7 @@ session cookie + CSRF token.
   because a restore reverts later revocations. A restore also reverts
   *usage*: spent bytes disappear and exhaustion flags clear, which recreates
   spendable allowance. Never restore a database over a live ledger — see
-  Rollback for the reconciliation procedure.
+  Rollback for the supported recovery options.
 - A database stamped with a newer `user_version` is refused by older
   binaries (fail-closed); upgrade the binary, never hand-edit the DB.
 
@@ -87,15 +94,11 @@ guarantee. Roll back the **binary only** and keep the current database:
    `exhausted` state as before the rollback.
 4. If the old binary refuses to start with `database schema generation …
    is newer`, the schema moved forward: do **not** force the old database
-   back. Either stay on the new binary (forward-fix) or reconcile
-   explicitly — carry every period's `charged_bytes` and `exhausted`
-   forward (taking the maximum of backup and live values), e.g.:
-   `sqlite3 live.db "ATTACH 'backup.db' AS b; UPDATE quota_periods SET
-   charged_bytes = max(charged_bytes, (SELECT charged_bytes FROM
-   b.quota_periods WHERE period = quota_periods.period)), exhausted =
-   exhausted OR (SELECT exhausted FROM b.quota_periods WHERE period =
-   quota_periods.period);"`
-   then re-verify `charged_bytes`/`exhausted` before opening traffic.
+   back. Reinstall a binary that supports the current schema and fix forward.
+   There is no supported database downgrade or automatic ledger merge.
+   Merging only usage would also miss approvals, revoked endpoints, settings,
+   and schema changes. Keep the service stopped if the current ledger is lost
+   or cannot be read; a stale backup is not proof of remaining allowance.
    Never fall back to an unrestricted relay binary: a failed custom server
    stays down, loud, rather than silently open.
 

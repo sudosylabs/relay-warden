@@ -33,7 +33,7 @@ startup-time guards read from the file only.
 | `handshake_timeout_secs` | `10` | Per-handshake deadline. |
 | `key_cache_capacity` | `1024` | Upstream relay key cache entries. |
 | `max_connections` | `1024` | Global concurrent relay-connection ceiling; over-limit connections authenticate but are dropped without service. |
-| `max_connections_per_endpoint` | `16` | Per-endpoint concurrent ceiling (`null` = unbounded). |
+| `max_connections_per_endpoint` | `16` | Per-endpoint concurrent ceiling. TOML cannot express `null`; omission keeps the default of 16. Choose a positive finite ceiling. |
 
 Per-endpoint records (`PUT /admin/endpoints/{id}`) carry `speed_policy`
 (`default`/`custom`/`unlimited`), optional `custom_rx_bps`/`custom_tx_bps`,

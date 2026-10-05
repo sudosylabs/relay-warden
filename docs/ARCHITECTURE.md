@@ -1,8 +1,8 @@
 # relay-warden architecture
 
 How the upstream library integrates with policy, shaping, and accounting.
-For operations see `OPERATIONS.md`; for settings reference see
-`CONFIGURATION.md`.
+See [operations](OPERATIONS.md) for deployment and recovery, or
+[configuration](CONFIGURATION.md) for settings.
 
 ## Upstream integration
 
@@ -50,11 +50,6 @@ revocation), `limiter` (directional buckets), `quota` (monthly ledger),
 (multi-step update coordinator), `config`, `observability` via
 `/admin/status` + `/admin/metrics`.
 
-## Design note
-
-Units, directions, lifecycle, and failure behavior in one place so
-operators do not have to infer them.
-
 ## Identity lifecycle
 
 An **endpoint ID** is the public key of one app instance (client-proven via
@@ -94,7 +89,7 @@ Three distinct numbers (never conflated in code or UI):
 2. **Charged bytes**: `payload + overhead allowance` (`quota_overhead_pct`,
    default 10%), committed to SQLite at chunk-grant time, before bytes enter
    the send pipeline. The enforced unit.
-3. **Observed egress**: VPS/OCI counters including TLS, retries, proxy, and
+3. **Observed egress**: host/provider counters including TLS, retries, proxy, and
    other services. Only visible outside this process.
 
 Enforcement: `charged + grant <= budget - headroom`, serialized by one quota

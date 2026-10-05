@@ -1,9 +1,9 @@
-# Acceptance mapping (Gate E)
+# Verification reference
 
 Every handoff requirement mapped to a test or a stated
 deployment-dependent check. Deployment itself is a separate authorized phase.
 
-## Gate A — unmodified dependency
+## Upstream embedding
 
 | Requirement | Evidence |
 |---|---|
@@ -12,7 +12,7 @@ deployment-dependent check. Deployment itself is a separate authorized phase.
 | Unauthorized rejection | `tests/relay.rs::relay_denies_unapproved_identity` (`ServerDeniedAuth`) |
 | Protocol negotiation (V2 preferred, V1 supported, others 400) | `src/relay.rs` unit tests; integration clients negotiate V2 |
 
-## Gate B — policy and live administration
+## Policy and administration
 
 | Requirement | Evidence |
 |---|---|
@@ -22,7 +22,7 @@ deployment-dependent check. Deployment itself is a separate authorized phase.
 | Admission/revocation race closed | publish-then-disconnect + register-then-revalidate; `tests/policy.rs::policy_admission_cache_and_live_counts` |
 | Lost-update protection, validation, escaped labels, audit without secrets | `tests/admin.rs::admin_upsert_validates_and_conflicts`, `tests/policy.rs::policy_validates_records_and_revisions` |
 
-## Gate C — throughput enforcement
+## Throughput enforcement
 
 | Requirement | Evidence |
 |---|---|
@@ -32,7 +32,7 @@ deployment-dependent check. Deployment itself is a separate authorized phase.
 | Reconnect resistance, ordering, no double-charge | `tests/limiter.rs::limiter_reconnect_keeps_balances`, seq-order asserts, exact counter asserts, debt-bucket unit tests |
 | Production default-limit gate | `require_default_limits` startup bail (deployment check: confirm values) |
 
-## Gate D — durable monthly enforcement
+## Durable monthly enforcement
 
 | Requirement | Evidence |
 |---|---|
@@ -44,7 +44,7 @@ deployment-dependent check. Deployment itself is a separate authorized phase.
 | Budget-cut exhaustion, edit isolation, audited reopen | `tests/quota.rs::quota_budget_cut_exhausts_but_edits_do_not_reset` |
 | No exact cloud-billing claim | `ARCHITECTURE.md` units section; `usage.uncertainty_note` |
 
-## Gate E — operations and delivery
+## Operations and delivery
 
 | Requirement | Evidence |
 |---|---|
@@ -65,7 +65,7 @@ deployment-dependent check. Deployment itself is a separate authorized phase.
 4. Connection `Config` rate-limit notify is internal → own counters; stock client-visible status not reproduced.
 5. Axum path negotiates V1+V2 honestly; integration traffic uses V2 (client default). V1 client interop is a **deployment check** with the intended client versions.
 
-## Review hardening (independent review, all addressed)
+## Safety regression coverage
 
 | Finding | Fix | Test |
 |---|---|---|
@@ -97,19 +97,19 @@ deployment-dependent check. Deployment itself is a separate authorized phase.
 
 ## Verification status (docs-release track, 2026-10-05)
 
-- Implemented: operator-first README + `CONFIGURATION`/`API`/`ARCHITECTURE`/
-  `OPERATIONS`/`CONTRIBUTING`/`RELEASING` docs; Apache-2.0 licence +
-  `LICENSE-APACHE`; `THIRD_PARTY_NOTICES.md` generated from `Cargo.lock`
-  (382 crates, all permissive, reviewed) with vendored upstream texts;
-  hardened CI (pins, concurrency, least privilege, timeouts, cache, locked
-  builds); release workflow (validate/build/smoke/publish separation,
-  dry-run default); `scripts/package.sh` + `scripts/smoke.sh` +
-  `scripts/check-ui.sh` + `scripts/gen-notices.sh`; tested client example.
-- Locally verified: `cargo fmt --check`, `cargo clippy --locked
-  --all-targets -- -D warnings`, `cargo test --locked` (62 green),
-  `scripts/check-ui.sh` + node syntax, YAML parses, doc-link check,
-  packaging drill + checksum verification, smoke test incl. a real approved
-  relayed transfer, README first-run flow against a temp state dir.
+- Delivery checks: CI and both native release builds run `scripts/check.sh`.
+  Release packaging verifies required files, executable permissions, source
+  metadata and checksums. Python regression tests cover malformed archives,
+  incomplete/corrupt artifact sets, draft retries and published-release refusal.
+- Local checks: formatting, Clippy, the Rust tests, Python release tests,
+  admin JavaScript syntax, local doc/config validation and actionlint 1.7.7.
+  An optimized macOS ARM64 package has been booted from fresh state and used
+  for bidirectional relay traffic. This is not a Linux binary-support claim.
+- Browser interaction remains a separate coverage gap: HTTP API tests and
+  JavaScript syntax checks do not prove the UI controls work in a browser.
+- Licence texts are collected from the target graph with explicit versioned
+  attribution exceptions. There is no blanket legal-compliance claim; review
+  the exceptions before a public release.
 - Hosted-only (explicitly unverified): GitHub workflow runs, ARM64/x86-64
   release artifacts, draft publication, `ubuntu-24.04-arm` runner
   availability. No tag, release, remote, or deployment was created.
