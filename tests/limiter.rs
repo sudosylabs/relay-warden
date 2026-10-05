@@ -1,220 +1,35 @@
-//! Gate C: shared per-endpoint throughput enforcement.
+//! Shared per-endpoint throughput enforcement.
 //!
-//! Timing bounds are one-sided on purpose: token math cannot go faster than
-//! the configured rate on any machine (lower bounds catch missing shaping),
-//! while upper bounds are generous (slow CI only makes shaping slower).
-//! Byte-counter assertions are exact up to framing overhead.
+//! Real relay traffic against small configured rates: sustained caps with
+//! exact per-frame accounting, the shared aggregate across connections,
+//! owner exemption with intact governance, live reshapes, reconnect reuse,
+//! and independent directions. Deterministic bucket semantics (clocks,
+//! debt, clamping) are unit-tested in `src/limiter.rs`.
 
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+mod common;
 
-use iroh_base::{EndpointId, RelayUrl, SecretKey};
-use iroh_dns::dns::DnsResolver;
-use iroh_relay::{
-    client::ClientBuilder,
-    protos::relay::{Datagrams, RelayToClientMsg},
-    tls::{default_provider, CaTlsConfig},
+use std::time::Duration;
+
+use common::{
+    admin_client, approve, endpoint_json, relay_connect, start, transfer, Harness, HarnessOptions,
 };
-use n0_future::{SinkExt, StreamExt};
-use relay_warden::{
-    admin::{load_admin_token, AdminState},
-    policy::PolicyManager,
-    store::Store,
-};
+use iroh_base::SecretKey;
 
 const RATE: u64 = 30_000; // B/s each direction for ordinary endpoints
 const BURST: u64 = 4_096; // clamp(RATE/10, 4096, 1M)
 
-fn tls_config() -> rustls::ClientConfig {
-    CaTlsConfig::default()
-        .client_config(default_provider())
-        .expect("tls")
-}
-
-struct Harness {
-    relay_addr: SocketAddr,
-    admin_addr: SocketAddr,
-    token: String,
-    _relay_handle: n0_future::task::AbortOnDropHandle<()>,
-    _admin_handle: n0_future::task::AbortOnDropHandle<()>,
-}
-
-async fn start_harness() -> Harness {
-    let dir = std::env::temp_dir().join(format!(
-        "warden-c-{}-{}",
-        std::process::id(),
-        rand::random::<u64>()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    let db_path = dir.join("warden.db");
-    let token_path = dir.join("admin.token");
-    let token = format!(
-        "test-token-{}-{}",
-        std::process::id(),
-        rand::random::<u64>()
-    );
-    std::fs::write(&token_path, &token).unwrap();
-
-    let token_bytes = load_admin_token(token_path.to_str().unwrap()).unwrap();
-    let store = Store::open(&db_path).await.unwrap();
-    store.ensure_defaults(Some(RATE), Some(RATE)).await.unwrap();
-    let policy = PolicyManager::open(store).await.unwrap();
-    let limiter = relay_warden::limiter::LimiterMap::new();
-
-    let relay_state = relay_warden::relay::RelayState::new(
-        policy.clone() as Arc<dyn iroh_relay::server::DynAccessControl>,
-        1024,
-        64,
-        Duration::from_secs(10),
-    )
-    .with_policy(policy.clone())
-    .with_limiter(limiter.clone());
-    let (relay_addr, _relay_handle) =
-        relay_warden::relay::serve("127.0.0.1:0".parse().unwrap(), relay_state)
-            .await
-            .unwrap();
-
-    let admin_state = AdminState::new(policy, limiter, None, token_bytes);
-    let app = relay_warden::admin::router(admin_state);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let admin_addr = listener.local_addr().unwrap();
-    let task = tokio::spawn(async move {
-        let _ = axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .await;
-    });
-    let _admin_handle = n0_future::task::AbortOnDropHandle::new(task);
-
-    Harness {
-        relay_addr,
-        admin_addr,
-        token,
-        _relay_handle,
-        _admin_handle,
-    }
-}
-
-fn admin_client(token: &str) -> reqwest::Client {
-    let mut headers = reqwest::header::HeaderMap::new();
-    headers.insert(
-        reqwest::header::AUTHORIZATION,
-        format!("Bearer {token}").parse().unwrap(),
-    );
-    reqwest::Client::builder()
-        .default_headers(headers)
-        .build()
-        .unwrap()
-}
-
-async fn approve(h: &Harness, id: &EndpointId, body: serde_json::Value) {
-    let mut map = serde_json::Map::new();
-    map.insert("label".into(), "t".into());
-    map.insert("approved".into(), true.into());
-    if let serde_json::Value::Object(extra) = body {
-        for (k, v) in extra {
-            map.insert(k, v);
-        }
-    }
-    let r = admin_client(&h.token)
-        .put(format!("http://{}/admin/endpoints/{id}", h.admin_addr))
-        .json(&serde_json::Value::Object(map))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(
-        r.status(),
-        200,
-        "approve {id}: {:?}",
-        r.text().await.unwrap()
-    );
-}
-
-async fn relay_connect(relay_addr: SocketAddr, sk: SecretKey) -> iroh_relay::client::Client {
-    let url: RelayUrl = format!("http://{relay_addr}").parse().unwrap();
-    ClientBuilder::new(url, sk, DnsResolver::new())
-        .tls_client_config(tls_config())
-        .connect()
-        .await
-        .expect("relay connect")
-}
-
-/// Sequence-numbered payload: first 4 bytes BE seq, rest pad.
-fn payload(seq: u32, size: usize) -> Vec<u8> {
-    let mut v = vec![0u8; size];
-    v[..4].copy_from_slice(&seq.to_be_bytes());
-    v
-}
-
-fn seq_of(data: &[u8]) -> u32 {
-    u32::from_be_bytes(data[..4].try_into().unwrap())
-}
-
-/// Blast `n` messages, collect in order. Returns (elapsed, total_payload).
-async fn transfer(
-    tx: &mut iroh_relay::client::Client,
-    rx: &mut iroh_relay::client::Client,
-    dst: EndpointId,
-    n: usize,
-    size: usize,
-) -> (Duration, usize) {
-    let start = std::time::Instant::now();
-    for i in 0..n {
-        tx.send(iroh_relay::protos::relay::ClientToRelayMsg::Datagrams {
-            dst_endpoint_id: dst,
-            datagrams: Datagrams::from(payload(i as u32, size)),
-        })
-        .await
-        .expect("send");
-    }
-    let mut got = Vec::with_capacity(n);
-    let deadline = Duration::from_secs(90);
-    while got.len() < n {
-        let elapsed = start.elapsed();
-        assert!(
-            elapsed < deadline,
-            "transfer stalled after {elapsed:?} ({}/{n})",
-            got.len()
-        );
-        let next = tokio::time::timeout(deadline - elapsed, rx.next()).await;
-        match next {
-            Ok(Some(Ok(RelayToClientMsg::Datagrams { datagrams, .. }))) => {
-                got.push(seq_of(&datagrams.contents));
-            }
-            Ok(Some(Ok(_))) => continue, // Status/health: ignore.
-            Ok(Some(Err(e))) => panic!("recv error: {e:#}"),
-            Ok(None) => panic!("connection closed mid-transfer"),
-            Err(_) => panic!("transfer timed out"),
-        }
-    }
-    for (i, s) in got.iter().enumerate() {
-        assert_eq!(*s, i as u32, "frame order violated at index {i}");
-    }
-    (start.elapsed(), n * size)
-}
-
-async fn endpoint_limits(h: &Harness, id: &EndpointId) -> serde_json::Value {
-    let list: serde_json::Value = admin_client(&h.token)
-        .get(format!("http://{}/admin/endpoints", h.admin_addr))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    list["endpoints"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|e| e["endpoint_id"] == id.to_string())
-        .cloned()
-        .expect("endpoint listed")
+async fn start_shaped() -> Harness {
+    start(HarnessOptions {
+        ordinary_limits: Some((RATE, RATE)),
+        ..Default::default()
+    })
+    .await
 }
 
 #[tokio::test]
-async fn gate_c_caps_sustained_rate() {
+async fn limiter_caps_sustained_rate() {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let h = start_harness().await;
+    let h = start_shaped().await;
     let a_sk = SecretKey::generate();
     let a_id = a_sk.public();
     let b_sk = SecretKey::generate();
@@ -235,8 +50,8 @@ async fn gate_c_caps_sustained_rate() {
     assert!(elapsed < Duration::from_secs(45), "too slow: {elapsed:?}");
 
     // Counters: exactly one charge per frame direction (payload + framing).
-    let la = endpoint_limits(&h, &a_id).await;
-    let lb = endpoint_limits(&h, &b_id).await;
+    let la = endpoint_json(&h, &a_id).await;
+    let lb = endpoint_json(&h, &b_id).await;
     let a_rx = la["limits"]["rx_bytes"].as_u64().unwrap();
     let b_tx = lb["limits"]["tx_bytes"].as_u64().unwrap();
     for (name, v) in [("a.rx", a_rx), ("b.tx", b_tx)] {
@@ -255,9 +70,9 @@ async fn gate_c_caps_sustained_rate() {
 }
 
 #[tokio::test]
-async fn gate_c_connections_share_allowance() {
+async fn limiter_connections_share_allowance() {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let h = start_harness().await;
+    let h = start_shaped().await;
     let a_sk = SecretKey::generate();
     let a_id = a_sk.public();
     let b_sk = SecretKey::generate();
@@ -287,7 +102,7 @@ async fn gate_c_connections_share_allowance() {
     );
     assert!(wall < Duration::from_secs(60), "too slow: {wall:?}");
 
-    let la = endpoint_limits(&h, &a_id).await;
+    let la = endpoint_json(&h, &a_id).await;
     assert!(
         la["limits"]["rx_bytes"].as_u64().unwrap() >= total as u64,
         "shared counter must cover both connections"
@@ -295,9 +110,9 @@ async fn gate_c_connections_share_allowance() {
 }
 
 #[tokio::test]
-async fn gate_c_unlimited_fast_but_still_governed() {
+async fn limiter_unlimited_fast_but_still_governed() {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let h = start_harness().await;
+    let h = start_shaped().await;
     let c_sk = SecretKey::generate();
     let c_id = c_sk.public();
     let d_sk = SecretKey::generate();
@@ -305,7 +120,7 @@ async fn gate_c_unlimited_fast_but_still_governed() {
     approve(&h, &c_id, serde_json::json!({"speed_policy": "unlimited"})).await;
     approve(&h, &d_id, serde_json::json!({"speed_policy": "unlimited"})).await;
 
-    let lc = endpoint_limits(&h, &c_id).await;
+    let lc = endpoint_json(&h, &c_id).await;
     // No limiter yet (lazy on connect); after connect both directions null.
     assert!(lc["limits"]["rx_bps"].is_null() || lc["limits"].get("note").is_some());
 
@@ -318,7 +133,7 @@ async fn gate_c_unlimited_fast_but_still_governed() {
         "unlimited should be fast: {elapsed:?}"
     );
 
-    let lc = endpoint_limits(&h, &c_id).await;
+    let lc = endpoint_json(&h, &c_id).await;
     assert_eq!(lc["limits"]["rx_bps"], serde_json::Value::Null);
     assert_eq!(lc["limits"]["tx_bps"], serde_json::Value::Null);
 
@@ -332,22 +147,14 @@ async fn gate_c_unlimited_fast_but_still_governed() {
         .await
         .unwrap();
     assert_eq!(r.status(), 200);
-    let closed = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            match c.next().await {
-                None | Some(Err(_)) => break,
-                Some(Ok(_)) => continue,
-            }
-        }
-    })
-    .await;
-    assert!(closed.is_ok(), "revoked owner connection did not close");
+    common::expect_close(&mut c, "revoked owner connection").await;
+    let _ = d;
 }
 
 #[tokio::test]
-async fn gate_c_live_update_reshapes_transfer() {
+async fn limiter_live_update_reshapes_transfer() {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let h = start_harness().await;
+    let h = start_shaped().await;
     let a_sk = SecretKey::generate();
     let a_id = a_sk.public();
     let b_sk = SecretKey::generate();
@@ -365,7 +172,7 @@ async fn gate_c_live_update_reshapes_transfer() {
     );
 
     // Lift A's cap mid-stream (needs current revision).
-    let cur = endpoint_limits(&h, &a_id).await;
+    let cur = endpoint_json(&h, &a_id).await;
     let rev = cur["revision"].as_i64().unwrap();
     let r = admin_client(&h.token)
         .put(format!("http://{}/admin/endpoints/{a_id}", h.admin_addr))
@@ -383,7 +190,7 @@ async fn gate_c_live_update_reshapes_transfer() {
     assert!(t2 < Duration::from_secs(5), "lifted cap still slow? {t2:?}");
 
     // Re-impose a custom cap on A: slow again, no reconnect.
-    let cur = endpoint_limits(&h, &a_id).await;
+    let cur = endpoint_json(&h, &a_id).await;
     let rev = cur["revision"].as_i64().unwrap();
     let r = admin_client(&h.token)
         .put(format!("http://{}/admin/endpoints/{a_id}", h.admin_addr))
@@ -400,9 +207,9 @@ async fn gate_c_live_update_reshapes_transfer() {
 }
 
 #[tokio::test]
-async fn gate_c_reconnect_keeps_balances() {
+async fn limiter_reconnect_keeps_balances() {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let h = start_harness().await;
+    let h = start_shaped().await;
     let a_sk = SecretKey::generate();
     let a_id = a_sk.public();
     let b_sk = SecretKey::generate();
@@ -420,7 +227,7 @@ async fn gate_c_reconnect_keeps_balances() {
     drop(a);
 
     // Same limiter object survives the reconnect (counters prove it).
-    let before = endpoint_limits(&h, &a_id).await;
+    let before = endpoint_json(&h, &a_id).await;
     let rx_before = before["limits"]["rx_bytes"].as_u64().unwrap();
     assert!(rx_before >= 30 * 2048);
 
@@ -432,7 +239,7 @@ async fn gate_c_reconnect_keeps_balances() {
         start.elapsed() >= Duration::from_millis(250),
         "fresh burst minted on reconnect?"
     );
-    let after = endpoint_limits(&h, &a_id).await;
+    let after = endpoint_json(&h, &a_id).await;
     assert!(
         after["limits"]["rx_bytes"].as_u64().unwrap() >= rx_before + 6 * 2048,
         "counters must accumulate on the surviving limiter"
@@ -440,9 +247,9 @@ async fn gate_c_reconnect_keeps_balances() {
 }
 
 #[tokio::test]
-async fn gate_c_directions_are_independent() {
+async fn limiter_directions_are_independent() {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let h = start_harness().await;
+    let h = start_shaped().await;
     // A: slow upload, free download. B: free both ways.
     let a_sk = SecretKey::generate();
     let a_id = a_sk.public();
@@ -466,10 +273,9 @@ async fn gate_c_directions_are_independent() {
         "upload not capped? {up:?}"
     );
 
-    let la = endpoint_limits(&h, &a_id).await;
+    let la = endpoint_json(&h, &a_id).await;
     assert_eq!(la["limits"]["rx_bps"], serde_json::json!(15_000));
     assert_eq!(la["limits"]["tx_bps"], serde_json::Value::Null);
-    let _ = la;
 
     // Download free: 22 x 2KiB back at loopback speed.
     let (down, _) = transfer(&mut b, &mut a, a_id, 22, 2048).await;
@@ -477,5 +283,4 @@ async fn gate_c_directions_are_independent() {
         down < Duration::from_secs(5),
         "download wrongly capped? {down:?}"
     );
-    let _ = la;
 }

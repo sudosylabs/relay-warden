@@ -42,4 +42,14 @@ Auth: `Authorization: Bearer <token>` for API clients, or session cookie + `X-CS
 rustup run 1.91.0 cargo test
 ```
 
-Gate A: two real relay clients transfer via warden; unknown denied. Gate B: persistence across reopen, unauthorized 401, validation + revision conflicts, live revoke closes connection while peers stay up, session/CSRF/Origin, settings versioning. Gate C: sustained-rate caps with exact per-frame accounting, shared aggregate across connections, unlimited speed with intact governance, live reshape without reconnect, reconnect balance reuse, independent directions. Gate D: exact concurrent-grant boundary, exhaustion closes all incl. owners with admin usable, both traffic classes charged, crash-preserved ledger, forward-only month rollover, budget-cut exhaustion with edit isolation. Gate E: bounded private metrics, once-per-period persisted alerts with failure isolation, per-endpoint + global ceilings, admin body cap, schema-generation guard. Docs: `docs/DESIGN.md`, `docs/OPERATIONS.md`, `docs/ACCEPTANCE.md`; artifacts in `deploy/` (prepare-only, never executed).
+Layout mirrors `src/`: each `tests/<module>.rs` covers one module's
+responsibility (`tests/common/mod.rs` holds the shared harness), with unit
+tests alongside the code they pin down:
+
+- `relay` — transfer, denial, global ceiling. `policy` — records, revisions,
+  admission, caps, revoke, quota flag. `store` — schema guard, settings,
+  rows, ledger math, audit. `limiter` — caps, sharing, exemption, live
+  updates, reconnect reuse, directions. `quota` — boundaries, exhaustion,
+  charging, crash recovery, rollover, budget cuts, alerts. `admin` — auth,
+  validation, revocation, sessions, status, metrics, body limits.
+  `access`/`config` — allowlist decisions, startup validation.
