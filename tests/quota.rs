@@ -27,7 +27,7 @@ use iroh_relay::{
 use n0_future::{SinkExt, StreamExt};
 use relay_warden::{
     policy::PolicyManager,
-    quota::{month_start, Clock, ManualClock},
+    quota::{month_start, AcquireReply, Clock, ManualClock, QuotaManager},
     store::Store,
 };
 
@@ -134,15 +134,21 @@ async fn quota_exhaustion_closes_all_including_owner() {
         "expected substantial traffic before exhaustion, got {n}"
     );
 
-    // Charged never exceeds the cutoff; received is bounded by cutoff plus
-    // in-flight debt (one frame per delivering connection at the edge).
+    // Charged never exceeds the cutoff; every delivered byte was reserved
+    // first, so received payload cannot exceed durable charges either.
     let u = usage(&h).await;
     assert_eq!(u["exhausted"], true);
-    assert!(u["charged_bytes"].as_u64().unwrap() <= 120_000);
-    assert!(u["charged_bytes"].as_u64().unwrap() > 120_000 - 8_192);
+    let charged = u["charged_bytes"].as_u64().unwrap();
+    assert!(charged <= 120_000, "overspent: {charged}");
     assert!(
-        bytes as u64 <= 120_000 + 16_384,
-        "received {bytes} exceeds cutoff + in-flight bound"
+        bytes as u64 <= charged,
+        "delivered {bytes} beyond durable charges {charged}"
+    );
+    // The delivering connection legitimately holds up to one maximal-frame
+    // lease plus a chunk remainder; bound the idle remainder, not the spend.
+    assert!(
+        charged > 120_000 - 65_536 - 2 * 8_192,
+        "remainder implausibly large: {charged}"
     );
     assert_eq!(u["warnings"]["w75"], true);
     assert_eq!(u["warnings"]["w90"], true);
@@ -205,14 +211,14 @@ async fn quota_owner_and_ordinary_both_charged() {
     transfer(&mut c, &mut b, b_id, 20, 2048).await; // owner -> ordinary
     let u = usage(&h).await;
     let charged = u["charged_bytes"].as_u64().unwrap();
-    // Both directions charged (overhead 0): >= 81_920 payload, slack bounded
-    // by two connection leases' unused remainders.
+    // Both directions charged (overhead 0). The delivering connection holds
+    // up to one maximal-frame lease plus chunk slack on top of payload.
     assert!(
         charged >= 81_920,
         "both classes must be charged, got {charged}"
     );
     assert!(
-        charged <= 81_920 + 2 * 8_192 + 8_192,
+        charged <= 81_920 + 65_536 + 2 * 8_192,
         "over-charge? {charged}"
     );
     assert_eq!(u["exhausted"], false);
@@ -407,6 +413,163 @@ async fn quota_alerts_fire_once_per_period() {
         .unwrap()
         .contains(&a_id.to_string()));
     let _ = (a, b);
+}
+
+#[tokio::test]
+async fn quota_large_frame_fully_reserved_before_send() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let h = start(HarnessOptions {
+        ordinary_limits: Some((10_000_000, 10_000_000)),
+        quota: Some(QuotaOpts {
+            budget: 1_000_000,
+            headroom: 0,
+            overhead: 0,
+            chunk: 1_024,
+        }),
+        ..Default::default()
+    })
+    .await;
+    let a_sk = SecretKey::generate();
+    let b_sk = SecretKey::generate();
+    let b_id = b_sk.public();
+    approve(
+        &h,
+        &a_sk.public(),
+        serde_json::json!({"speed_policy": "unlimited"}),
+    )
+    .await;
+    approve(&h, &b_id, serde_json::json!({"speed_policy": "unlimited"})).await;
+    let mut a = relay_connect(h.relay_addr, a_sk).await;
+    let mut b = relay_connect(h.relay_addr, b_sk).await;
+    let (_, delivered) = transfer(&mut a, &mut b, b_id, 1, 12_000).await;
+    drop(a);
+    drop(b);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    h.quota.clone().expect("quota").refresh().await;
+    let u = usage(&h).await;
+    // The whole frame was reserved before send: durable charges cover it.
+    assert!(
+        u["charged_bytes"].as_u64().unwrap() >= delivered as u64,
+        "delivered {delivered} bytes but durable charges are {u}"
+    );
+}
+
+#[tokio::test]
+async fn quota_oversize_frame_cannot_spend_beyond_budget() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let h = start(HarnessOptions {
+        ordinary_limits: Some((10_000_000, 10_000_000)),
+        quota: Some(QuotaOpts {
+            budget: 1_024,
+            headroom: 0,
+            overhead: 0,
+            chunk: 1_024,
+        }),
+        ..Default::default()
+    })
+    .await;
+    let a_sk = SecretKey::generate();
+    let b_sk = SecretKey::generate();
+    let b_id = b_sk.public();
+    approve(
+        &h,
+        &a_sk.public(),
+        serde_json::json!({"speed_policy": "unlimited"}),
+    )
+    .await;
+    approve(&h, &b_id, serde_json::json!({"speed_policy": "unlimited"})).await;
+    let mut a = relay_connect(h.relay_addr, a_sk).await;
+    let mut b = relay_connect(h.relay_addr, b_sk).await;
+    // A 12 KiB frame against a 1 KiB budget: the full charge can never be
+    // reserved, so nothing is delivered; exhaustion still disconnects.
+    a.send(iroh_relay::protos::relay::ClientToRelayMsg::Datagrams {
+        dst_endpoint_id: b_id,
+        datagrams: Datagrams::from(vec![0u8; 12_000]),
+    })
+    .await
+    .unwrap();
+    let msg = tokio::time::timeout(Duration::from_secs(2), b.next()).await;
+    assert!(
+        !matches!(msg, Ok(Some(Ok(RelayToClientMsg::Datagrams { .. })))),
+        "frame delivered against an unreservable budget"
+    );
+    expect_close(&mut b, "unfunded frame connection").await;
+    assert_eq!(usage(&h).await["exhausted"], true);
+}
+
+#[tokio::test]
+async fn quota_old_lease_refund_cannot_reduce_new_month() {
+    let h = start(HarnessOptions {
+        ordinary_limits: Some((10_000_000, 10_000_000)),
+        quota: Some(QuotaOpts {
+            budget: 1_000_000,
+            headroom: 0,
+            overhead: 0,
+            chunk: 1_024,
+        }),
+        ..Default::default()
+    })
+    .await;
+    let q = h.quota.clone().expect("quota");
+    let old_client = q.client();
+    let old_gen = old_client.generation();
+    let reply = old_client
+        .try_acquire()
+        .expect("channel")
+        .await
+        .expect("reply");
+    assert!(matches!(reply, AcquireReply::Granted { bytes: 1_024, .. }));
+    h.clock
+        .clone()
+        .expect("clock")
+        .set(month_start("2026-04").unwrap());
+    q.refresh().await;
+    assert!(q.acquire(2_000).await);
+    // Stale-generation refund is dropped, not subtracted from April.
+    old_client.return_unused(1_024, old_gen);
+    q.refresh().await;
+    let current = usage(&h).await;
+    assert_eq!(
+        current["charged_bytes"], 2_000,
+        "old-period refund reduced current ledger: {current}"
+    );
+}
+
+#[tokio::test]
+async fn quota_restart_after_rollback_keeps_latest_ledger() {
+    let h = start(HarnessOptions {
+        ordinary_limits: Some((10_000_000, 10_000_000)),
+        quota: Some(QuotaOpts {
+            budget: 1_000_000,
+            headroom: 0,
+            overhead: 0,
+            chunk: 1_024,
+        }),
+        ..Default::default()
+    })
+    .await;
+    let q = h.quota.clone().expect("quota");
+    h.clock
+        .clone()
+        .expect("clock")
+        .set(month_start("2026-04").unwrap());
+    q.refresh().await;
+    assert!(q.acquire(1_000_000).await);
+    assert!(!q.acquire(1).await);
+    // Restart with the wall clock rolled back: the latest durable ledger
+    // (exhausted April) wins over the empty March the clock suggests.
+    let store = Store::open(&h.db_path).await.unwrap();
+    let policy = PolicyManager::open(store.clone()).await.unwrap();
+    let rollback_clock: Arc<dyn Clock> =
+        Arc::new(ManualClock::new(month_start("2026-03").unwrap()));
+    let restarted = QuotaManager::open(store, policy, rollback_clock)
+        .await
+        .unwrap();
+    assert!(
+        restarted.exhausted(),
+        "rollback+restart reopened spent quota: {:?}",
+        restarted.usage().await.unwrap()
+    );
 }
 
 #[tokio::test]

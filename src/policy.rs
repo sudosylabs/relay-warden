@@ -86,21 +86,100 @@ impl EndpointPolicy {
     }
 }
 
+/// Three-state field update: omitted leaves the value unchanged, explicit
+/// `null` clears it, and a value sets it. Plain `Option<Option<T>>` cannot
+/// express this with serde (JSON `null` and a missing field both become
+/// `None`), so clearing a custom cap back to `unlimited` needs this type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TriState<T> {
+    /// Field omitted: keep the stored value.
+    #[default]
+    Unchanged,
+    /// Explicit `null`: clear the stored value.
+    Clear,
+    /// A new value.
+    Set(T),
+}
+
+impl<'de, T> serde::Deserialize<'de> for TriState<T>
+where
+    T: serde::Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct TriStateVisitor<T>(std::marker::PhantomData<T>);
+        impl<'de, T> serde::de::Visitor<'de> for TriStateVisitor<T>
+        where
+            T: serde::Deserialize<'de>,
+        {
+            type Value = TriState<T>;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("omitted, null, or a value")
+            }
+
+            fn visit_none<E>(self) -> Result<TriState<T>, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(TriState::Clear)
+            }
+
+            fn visit_unit<E>(self) -> Result<TriState<T>, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(TriState::Clear)
+            }
+
+            fn visit_some<D>(self, deserializer: D) -> Result<TriState<T>, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                T::deserialize(deserializer).map(TriState::Set)
+            }
+        }
+        deserializer.deserialize_option(TriStateVisitor(std::marker::PhantomData))
+    }
+}
+
 /// Input for create/update. `revision` is required for updates.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Directional rates are tri-state: omitted leaves the value unchanged,
+/// explicit `null` clears it, and a number sets it — so a custom cap can be
+/// removed again (e.g. when switching to `unlimited`).
+#[derive(Debug, Clone, Deserialize)]
 pub struct EndpointUpsert {
     pub label: Option<String>,
     pub approved: Option<bool>,
     pub speed_policy: Option<String>,
-    pub custom_rx_bps: Option<i64>,
-    pub custom_tx_bps: Option<i64>,
-    pub burst_bytes: Option<i64>,
+    #[serde(default)]
+    pub custom_rx_bps: TriState<i64>,
+    #[serde(default)]
+    pub custom_tx_bps: TriState<i64>,
+    #[serde(default)]
+    pub burst_bytes: TriState<i64>,
     pub revision: Option<i64>,
 }
 
 pub fn validate_endpoint_id(s: &str) -> Result<EndpointId, String> {
     s.parse::<EndpointId>()
         .map_err(|e| format!("invalid endpoint_id: {e:#}"))
+}
+
+/// Parse an endpoint ID and return its canonical (hex) spelling.
+/// Admission looks up canonical hex, so every domain entry point must store
+/// and query this form — never the operator's original spelling.
+pub fn canonicalize_endpoint_id(s: &str) -> Result<String, String> {
+    Ok(validate_endpoint_id(s)?.to_string())
+}
+
+/// Best-effort canonicalization for lookups: unparseable input simply misses.
+pub fn canonicalize_for_lookup(s: &str) -> String {
+    s.parse::<EndpointId>()
+        .map(|id| id.to_string())
+        .unwrap_or_else(|_| s.to_string())
 }
 
 pub fn canonical_endpoint_id(id: &EndpointId) -> String {
@@ -166,14 +245,20 @@ pub fn apply_upsert(
     if let Some(sp) = &input.speed_policy {
         rec.speed_policy = sp.parse::<SpeedPolicy>()?;
     }
-    if input.custom_rx_bps.is_some() {
-        rec.custom_rx_bps = validate_bps(input.custom_rx_bps, "custom_rx_bps")?;
+    match input.custom_rx_bps {
+        TriState::Unchanged => {}
+        TriState::Clear => rec.custom_rx_bps = None,
+        TriState::Set(v) => rec.custom_rx_bps = validate_bps(Some(v), "custom_rx_bps")?,
     }
-    if input.custom_tx_bps.is_some() {
-        rec.custom_tx_bps = validate_bps(input.custom_tx_bps, "custom_tx_bps")?;
+    match input.custom_tx_bps {
+        TriState::Unchanged => {}
+        TriState::Clear => rec.custom_tx_bps = None,
+        TriState::Set(v) => rec.custom_tx_bps = validate_bps(Some(v), "custom_tx_bps")?,
     }
-    if input.burst_bytes.is_some() {
-        rec.burst_bytes = validate_burst(input.burst_bytes)?;
+    match input.burst_bytes {
+        TriState::Unchanged => {}
+        TriState::Clear => rec.burst_bytes = None,
+        TriState::Set(v) => rec.burst_bytes = validate_burst(Some(v))?,
     }
 
     // Custom requires at least one direction; unlimited must not carry customs.
@@ -339,31 +424,49 @@ impl PolicyManager {
     }
 
     /// Upsert + publish to cache. Returns the stored record.
+    /// Canonicalizing compare-and-swap: the revision check and the write
+    /// are one database statement, so concurrent edits on the same revision
+    /// cannot both succeed and a stale edit cannot overwrite a concurrent
+    /// revocation. The cache is published only after the commit; on conflict
+    /// it is refreshed from the winning row.
     pub async fn upsert(
         &self,
         endpoint_id: &str,
         input: &EndpointUpsert,
     ) -> Result<EndpointPolicy, String> {
-        let existing = self.cache.read().expect("lock").get(endpoint_id).cloned();
-        let rec = apply_upsert(existing.as_ref(), endpoint_id, input)?;
-        self.store.upsert_endpoint(&rec).await?;
-        self.cache
-            .write()
-            .expect("lock")
-            .insert(endpoint_id.to_string(), rec.clone());
-        Ok(rec)
+        let endpoint_id = canonicalize_endpoint_id(endpoint_id)?;
+        let existing = self.cache.read().expect("lock").get(&endpoint_id).cloned();
+        let rec = apply_upsert(existing.as_ref(), &endpoint_id, input)?;
+        let expected = existing.as_ref().map(|e| e.revision);
+        match self.store.upsert_endpoint_cas(&rec, expected).await {
+            Ok(()) => {
+                self.cache
+                    .write()
+                    .expect("lock")
+                    .insert(endpoint_id, rec.clone());
+                Ok(rec)
+            }
+            Err(e) => {
+                // Refresh the cache from the winning row so the next attempt
+                // validates against current state, then report the conflict.
+                if let Ok(cur) = self.store.get_endpoint(&endpoint_id).await {
+                    self.cache.write().expect("lock").insert(endpoint_id, cur);
+                }
+                Err(e)
+            }
+        }
     }
 
     /// Revoke: publish deny, then disconnect existing + in-flight (which
     /// revalidate after register and kill themselves if still denied).
     pub async fn revoke(&self, endpoint_id: &str) -> Result<(EndpointPolicy, bool), String> {
-        validate_endpoint_id(endpoint_id)?;
-        let rec = self.store.set_approved(endpoint_id, false).await?;
+        let endpoint_id = canonicalize_endpoint_id(endpoint_id)?;
+        let rec = self.store.set_approved(&endpoint_id, false).await?;
         self.cache
             .write()
             .expect("lock")
             .insert(endpoint_id.to_string(), rec.clone());
-        let had_live = self.live_count(endpoint_id) > 0;
+        let had_live = self.live_count(&endpoint_id) > 0;
         if let Ok(id) = endpoint_id.parse::<EndpointId>() {
             if let Some(c) = self.clients.read().expect("lock").clone() {
                 c.disconnect(id, None);
@@ -385,7 +488,8 @@ impl PolicyManager {
     }
 
     pub fn get(&self, endpoint_id: &str) -> Option<EndpointPolicy> {
-        self.cache.read().expect("lock").get(endpoint_id).cloned()
+        let key = canonicalize_for_lookup(endpoint_id);
+        self.cache.read().expect("lock").get(&key).cloned()
     }
 
     pub fn list(&self) -> Vec<EndpointPolicy> {

@@ -25,6 +25,7 @@ use crate::{
     limiter::LimiterMap,
     policy::{escape_html, EndpointUpsert, PolicyManager},
     quota::QuotaManager,
+    service::App,
 };
 
 const SESSION_COOKIE: &str = "warden_session";
@@ -40,9 +41,7 @@ struct Session {
 
 #[derive(Debug, Clone)]
 pub struct AdminState {
-    policy: Arc<PolicyManager>,
-    limiter: Arc<LimiterMap>,
-    quota: Option<Arc<QuotaManager>>,
+    app: Arc<App>,
     token: Vec<u8>,
     sessions: Arc<tokio::sync::Mutex<HashMap<String, Session>>>,
     login_attempts: Arc<tokio::sync::Mutex<HashMap<String, (usize, Instant)>>>,
@@ -56,10 +55,9 @@ impl AdminState {
         quota: Option<Arc<QuotaManager>>,
         token: Vec<u8>,
     ) -> Self {
+        let store = policy.store().clone();
         Self {
-            policy,
-            limiter,
-            quota,
+            app: Arc::new(App::new(policy, limiter, quota, store)),
             token,
             sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             login_attempts: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -169,6 +167,15 @@ fn origin_allowed(origin: &str, host: Option<&str>) -> bool {
     false
 }
 
+impl AdminState {
+    async fn audit(&self, action: &str, target: &str) {
+        self.app
+            .store
+            .append_audit("admin", action, target, "")
+            .await;
+    }
+}
+
 fn json_err(status: StatusCode, msg: &str) -> Response {
     (status, axum::Json(serde_json::json!({ "error": msg }))).into_response()
 }
@@ -195,55 +202,177 @@ pub fn router(state: AdminState) -> Router {
 }
 
 async fn ui_handler() -> Html<&'static str> {
-    // Static shell; data loads via fetch (so HTML itself needs no auth).
+    // Static shell; all data loads via the authenticated API. Every dynamic
+    // string is injected with textContent (never innerHTML).
     Html(
-        r#"<!doctype html><html><head><meta charset="utf-8"><title>relay-warden admin</title></head>
+        r#"<!doctype html><html><head><meta charset="utf-8"><title>relay-warden admin</title>
+<style>body{font-family:sans-serif;max-width:72em;margin:2em}table{border-collapse:collapse}td,th{border:1px solid #999;padding:.3em .6em;font-size:.9em}input,select{max-width:14em}.row-form input{width:9em}</style>
+</head>
 <body><h1>relay-warden admin</h1>
 <p>Private interface. Log in with the admin token (stored only in your secret file).</p>
 <div><input id="tok" type="password" placeholder="admin token" autocomplete="off">
-<button onclick="login()">Login</button> <button onclick="logout()">Logout</button></div>
+<button id="loginBtn">Login</button> <button id="logoutBtn">Logout</button></div>
 <pre id="out">not logged in</pre>
+<h2>Add endpoint</h2>
+<div><input id="newId" placeholder="endpoint id (hex or base32)" size="70">
+<input id="newLabel" placeholder="label">
+<button id="addBtn">Add (unapproved)</button></div>
 <h2>Endpoints</h2><div id="eps"></div>
 <h2>Monthly budget</h2><pre id="usage"></pre>
+<h2>Settings</h2><div id="settings"></div>
+<h2>Recent admin events</h2><div id="audit"></div>
 <script>
-let csrf=null;
-function headers(extra) {{
-  const h={{'Content-Type':'application/json'}};
-  if(csrf) h['X-CSRF-Token']=csrf;
-  return Object.assign(h, extra||{{}});
-}}
-async function login() {{
-  const token=document.getElementById('tok').value;
-  const r=await fetch('login',{{method:'POST',headers:headers(),body:JSON.stringify({{token}})}});
-  const j=await r.json();
-  if(r.ok){{csrf=j.csrf;document.getElementById('out').textContent='logged in';refresh();}}
-  else document.getElementById('out').textContent='login failed: '+(j.error||r.status);
-  document.getElementById('tok').value='';
-}}
-async function logout(){{await fetch('logout',{{method:'POST',headers:headers()}});csrf=null;document.getElementById('out').textContent='logged out';}}
-async function refresh(){{
-  const r=await fetch('endpoints',{{headers:headers()}});
-  const j=await r.json();
-  const div=document.getElementById('eps');div.textContent='';
-  if(!r.ok){{div.textContent='error: '+(j.error||r.status);return;}}
-  const table=document.createElement('table');
-  for(const e of j.endpoints){{
-    const tr=document.createElement('tr');
-    for(const k of ['endpoint_id','label','approved','speed_policy','revision']){{
-      const td=document.createElement('td');td.textContent=e[k];tr.appendChild(td);
-    }}
-    const td=document.createElement('td');td.textContent='live='+(e.live_connections??0);tr.appendChild(td);
+"use strict";
+let csrf = null;
+function headers(extra) {
+  const h = {'Content-Type': 'application/json'};
+  if (csrf) h['X-CSRF-Token'] = csrf;
+  return Object.assign(h, extra || {});
+}
+function msg(t) { document.getElementById('out').textContent = t; }
+function td(text) { const c = document.createElement('td'); c.textContent = text; return c; }
+function numInput(id, val) {
+  const i = document.createElement('input'); i.id = id; i.type = 'number'; i.min = '0';
+  if (val !== null && val !== undefined) i.value = val;
+  return i;
+}
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  let j = null;
+  try { j = await r.json(); } catch (e) { /* non-JSON error page */ }
+  return {ok: r.ok, status: r.status, body: j};
+}
+async function login() {
+  const token = document.getElementById('tok').value;
+  const r = await api('login', {method: 'POST', headers: headers(), body: JSON.stringify({token: token})});
+  if (r.ok) { csrf = r.body.csrf; msg('logged in'); refresh(); }
+  else msg('login failed: ' + ((r.body && r.body.error) || r.status));
+  document.getElementById('tok').value = '';
+}
+async function logout() {
+  await api('logout', {method: 'POST', headers: headers()});
+  csrf = null; msg('logged out');
+}
+async function refresh() {
+  await Promise.all([refreshEndpoints(), refreshUsage(), refreshSettings(), refreshAudit()]);
+}
+async function refreshEndpoints() {
+  const div = document.getElementById('eps'); div.textContent = '';
+  const r = await api('endpoints', {headers: headers()});
+  if (!r.ok) { div.textContent = 'error: ' + ((r.body && r.body.error) || r.status); return; }
+  const table = document.createElement('table');
+  const head = document.createElement('tr');
+  ['endpoint', 'label', 'approved', 'speed', 'rx', 'tx', 'burst', 'rev', 'live', 'limits', ''].forEach(function(k) {
+    const th = document.createElement('th'); th.textContent = k; head.appendChild(th);
+  });
+  table.appendChild(head);
+  r.body.endpoints.forEach(function(e) {
+    const tr = document.createElement('tr');
+    tr.appendChild(td(e.endpoint_id));
+    const lab = document.createElement('input'); lab.value = e.label || '';
+    const labTd = document.createElement('td'); labTd.appendChild(lab); tr.appendChild(labTd);
+    const app = document.createElement('input'); app.type = 'checkbox'; app.checked = !!e.approved;
+    const appTd = document.createElement('td'); appTd.appendChild(app); tr.appendChild(appTd);
+    const spd = document.createElement('select');
+    ['default', 'custom', 'unlimited'].forEach(function(o) {
+      const op = document.createElement('option'); op.value = o; op.textContent = o;
+      if (e.speed_policy === o) op.selected = true;
+      spd.appendChild(op);
+    });
+    const spdTd = document.createElement('td'); spdTd.appendChild(spd); tr.appendChild(spdTd);
+    const rx = numInput(null, e.custom_rx_bps); const rxTd = document.createElement('td'); rxTd.appendChild(rx); tr.appendChild(rxTd);
+    const tx = numInput(null, e.custom_tx_bps); const txTd = document.createElement('td'); txTd.appendChild(tx); tr.appendChild(txTd);
+    const bu = numInput(null, e.burst_bytes); const buTd = document.createElement('td'); buTd.appendChild(bu); tr.appendChild(buTd);
+    tr.appendChild(td(String(e.revision)));
+    tr.appendChild(td('live=' + (e.live_connections == null ? 0 : e.live_connections)));
+    const lim = (e.limits && e.limits.rx_bps != null) ? (e.limits.rx_bps + '/' + e.limits.tx_bps) : 'unlimited';
+    tr.appendChild(td(lim));
+    const btnTd = document.createElement('td');
+    const save = document.createElement('button'); save.textContent = 'Save';
+    save.onclick = async function() {
+      const body = {revision: e.revision, label: lab.value, approved: app.checked, speed_policy: spd.value,
+        custom_rx_bps: rx.value === '' ? null : Number(rx.value),
+        custom_tx_bps: tx.value === '' ? null : Number(tx.value),
+        burst_bytes: bu.value === '' ? null : Number(bu.value)};
+      const r2 = await api('endpoints/' + encodeURIComponent(e.endpoint_id),
+        {method: 'PUT', headers: headers(), body: JSON.stringify(body)});
+      msg(r2.ok ? 'saved ' + e.endpoint_id : 'save failed: ' + ((r2.body && r2.body.error) || r2.status));
+      refreshEndpoints();
+    };
+    const revoke = document.createElement('button'); revoke.textContent = 'Revoke';
+    revoke.onclick = async function() {
+      const r2 = await api('endpoints/' + encodeURIComponent(e.endpoint_id) + '/revoke',
+        {method: 'POST', headers: headers()});
+      msg(r2.ok ? 'revoked' : 'revoke failed: ' + ((r2.body && r2.body.error) || r2.status));
+      refreshEndpoints();
+    };
+    btnTd.appendChild(save); btnTd.appendChild(revoke); tr.appendChild(btnTd);
     table.appendChild(tr);
-  }}
+  });
   div.appendChild(table);
-  const u=await fetch('usage',{headers:headers()});
-  const uj=await u.json();
-  document.getElementById('usage').textContent=u.ok?JSON.stringify(uj,null,1):('error: '+(uj.error||u.status));
-}}
+}
+async function addEndpoint() {
+  const id = document.getElementById('newId').value.trim();
+  const label = document.getElementById('newLabel').value;
+  const r = await api('endpoints/' + encodeURIComponent(id),
+    {method: 'PUT', headers: headers(), body: JSON.stringify({label: label})});
+  msg(r.ok ? 'added (unapproved)' : 'add failed: ' + ((r.body && r.body.error) || r.status));
+  refreshEndpoints();
+}
+async function refreshUsage() {
+  const r = await api('usage', {headers: headers()});
+  document.getElementById('usage').textContent = r.ok ? JSON.stringify(r.body, null, 1) : ('error: ' + ((r.body && r.body.error) || r.status));
+}
+async function refreshSettings() {
+  const div = document.getElementById('settings'); div.textContent = '';
+  const r = await api('settings', {headers: headers()});
+  if (!r.ok) { div.textContent = 'error: ' + ((r.body && r.body.error) || r.status); return; }
+  const keys = ['default_rx_bps', 'default_tx_bps', 'quota_budget_bytes', 'quota_headroom_bytes',
+    'quota_overhead_pct', 'quota_chunk_bytes', 'alert_webhook_url'];
+  const inputs = {};
+  keys.forEach(function(k) {
+    const lab = document.createElement('label'); lab.textContent = k + ': ';
+    const inp = document.createElement('input');
+    const v = r.body.settings[k];
+    inp.value = (v === null || v === undefined) ? '' : v;
+    if (k === 'alert_webhook_url') inp.size = 50;
+    inputs[k] = inp; lab.appendChild(inp); div.appendChild(lab); div.appendChild(document.createElement('br'));
+  });
+  const save = document.createElement('button'); save.textContent = 'Save settings';
+  save.onclick = async function() {
+    const patch = {};
+    keys.forEach(function(k) {
+      const raw = inputs[k].value;
+      if (raw === '') { patch[k] = null; return; }
+      patch[k] = (k === 'alert_webhook_url') ? raw : Number(raw);
+    });
+    const r2 = await api('settings',
+      {method: 'PATCH', headers: headers(), body: JSON.stringify({version: r.body.version, settings: patch})});
+    msg(r2.ok ? 'settings saved' : 'settings failed: ' + ((r2.body && r2.body.error) || r2.status));
+    refreshSettings();
+  };
+  div.appendChild(save);
+  const ver = document.createElement('span'); ver.textContent = ' (version ' + r.body.version + ')';
+  div.appendChild(ver);
+}
+async function refreshAudit() {
+  const div = document.getElementById('audit'); div.textContent = '';
+  const r = await api('audit?limit=20', {headers: headers()});
+  if (!r.ok) { div.textContent = 'error: ' + ((r.body && r.body.error) || r.status); return; }
+  const table = document.createElement('table');
+  r.body.events.forEach(function(ev) {
+    const tr = document.createElement('tr');
+    [ev.at, ev.actor, ev.action, ev.target].forEach(function(x) { tr.appendChild(td(x || '')); });
+    table.appendChild(tr);
+  });
+  div.appendChild(table);
+}
+document.getElementById('loginBtn').onclick = login;
+document.getElementById('logoutBtn').onclick = logout;
+document.getElementById('addBtn').onclick = addEndpoint;
 </script></body></html>"#,
     )
 }
-
 #[derive(serde::Deserialize)]
 struct LoginBody {
     token: String,
@@ -270,11 +399,7 @@ async fn login_handler(
     }
     let _ = headers; // no auth needed for login itself
     if !bearer_valid(body.token.trim(), &state.token) {
-        state
-            .policy
-            .store()
-            .append_audit("admin", "login_failed", "", "")
-            .await;
+        state.audit("login_failed", "").await;
         return json_err(StatusCode::UNAUTHORIZED, "invalid token");
     }
     // Reset counter on success.
@@ -292,11 +417,7 @@ async fn login_handler(
             expires: Instant::now() + SESSION_TTL,
         },
     );
-    state
-        .policy
-        .store()
-        .append_audit("admin", "login", "", "")
-        .await;
+    state.audit("login", "").await;
     let cookie =
         format!("{SESSION_COOKIE}={sid}; Path=/admin; HttpOnly; SameSite=Lax; Max-Age=3600");
     (
@@ -312,11 +433,7 @@ async fn logout_handler(State(state): State<AdminState>, headers: HeaderMap) -> 
     if let Some(sid) = cookies.get(SESSION_COOKIE) {
         state.sessions.lock().await.remove(sid);
     }
-    state
-        .policy
-        .store()
-        .append_audit("admin", "logout", "", "")
-        .await;
+    state.audit("logout", "").await;
     (
         StatusCode::OK,
         [(
@@ -333,15 +450,15 @@ async fn list_handler(State(state): State<AdminState>, headers: HeaderMap) -> Re
         return json_err(StatusCode::UNAUTHORIZED, "unauthorized");
     }
     let mut out = Vec::new();
-    for e in state.policy.list() {
-        let live = state.policy.live_count(&e.endpoint_id);
+    for e in state.app.policy.list() {
+        let live = state.app.policy.live_count(&e.endpoint_id);
         let mut v = serde_json::to_value(&e).unwrap_or_default();
         v["live_connections"] = live.into();
         // Escape label for any server-rendered context; JSON keeps raw too.
         v["label_escaped"] = escape_html(&e.label).into();
         // Effective limits + observed counters (Gate C). Directions state the
         // contract: both capped independently; null = unlimited (owner).
-        if let Some(lim) = state.limiter.get(&e.endpoint_id) {
+        if let Some(lim) = state.app.limiter.get(&e.endpoint_id) {
             let s = lim.stats();
             v["limits"] = serde_json::json!({
                 "rx_bps": s.rx_bps,
@@ -381,34 +498,19 @@ async fn upsert_handler(
         };
         return json_err(s, msg);
     }
-    match state.policy.upsert(&id, &body).await {
-        Ok(rec) => {
-            state
-                .policy
-                .store()
-                .append_audit("admin", "endpoint_upsert", &id, "")
-                .await;
-            // Push the new limits into the live limiter: no restart or
-            // reconnect needed for the transfer to reshape.
-            state.limiter.apply_record(
-                &rec,
-                &state.policy.defaults_snapshot(),
-                std::time::Instant::now(),
-            );
-            // If approval was removed, disconnect live (same as revoke path).
-            if !rec.approved {
-                // Best-effort; post-register revalidation covers in-flight.
-                if let Ok(id) = rec.endpoint_id.parse() {
-                    state.policy.revalidate(&id);
-                }
-            }
-            (
-                StatusCode::OK,
-                axum::Json(serde_json::to_value(&rec).unwrap()),
-            )
-                .into_response()
-        }
-        Err(e) if e.contains("revision conflict") || e.contains("revision required") => {
+    // One coordinator call preserves commit/audit/propagation invariants.
+    match state.app.upsert_endpoint(&id, &body).await {
+        Ok(rec) => (
+            StatusCode::OK,
+            axum::Json(serde_json::to_value(&rec).unwrap()),
+        )
+            .into_response(),
+        Err(e)
+            if e.contains("revision conflict")
+                || e.contains("revision required")
+                || e.contains("reread and retry")
+                || e.contains("already exists") =>
+        {
             json_err(StatusCode::CONFLICT, &e)
         }
         Err(e) => json_err(StatusCode::BAD_REQUEST, &e),
@@ -432,13 +534,8 @@ async fn revoke_handler(
         };
         return json_err(s, msg);
     }
-    match state.policy.revoke(&id).await {
+    match state.app.revoke_endpoint(&id).await {
         Ok((rec, had_live)) => {
-            state
-                .policy
-                .store()
-                .append_audit("admin", "endpoint_revoke", &id, "")
-                .await;
             axum::Json(serde_json::json!({ "endpoint": rec, "had_live_connections": had_live }))
                 .into_response()
         }
@@ -451,8 +548,8 @@ async fn status_handler(State(state): State<AdminState>, headers: HeaderMap) -> 
         return json_err(StatusCode::UNAUTHORIZED, "unauthorized");
     }
     // DB liveness: list is cheap; treat error as not ok.
-    let db_ok = state.policy.store().recent_audit(1).await.is_ok();
-    let snap = state.limiter.snapshot();
+    let db_ok = state.app.policy.store().recent_audit(1).await.is_ok();
+    let snap = state.app.limiter.snapshot();
     let (mut rx_bytes, mut tx_bytes, mut throttled_bytes, mut throttled_ms) =
         (0u64, 0u64, 0u64, 0u64);
     for (_, s) in &snap {
@@ -461,7 +558,7 @@ async fn status_handler(State(state): State<AdminState>, headers: HeaderMap) -> 
         throttled_bytes += s.throttled_bytes;
         throttled_ms += s.throttled_wait_ms;
     }
-    let quota_status = match &state.quota {
+    let quota_status = match &state.app.quota {
         Some(q) => q
             .usage()
             .await
@@ -472,17 +569,17 @@ async fn status_handler(State(state): State<AdminState>, headers: HeaderMap) -> 
         "service": "relay-warden",
         "version": env!("CARGO_PKG_VERSION"),
         "db_ok": db_ok,
-        "live_connections": state.policy.live_total(),
-        "approved_endpoints": state.policy.approved_count(),
+        "live_connections": state.app.policy.live_total(),
+        "approved_endpoints": state.app.policy.approved_count(),
         "limited_endpoints": snap.len(),
         "rx_bytes": rx_bytes,
         "tx_bytes": tx_bytes,
         "throttled_bytes": throttled_bytes,
         "throttled_wait_ms": throttled_ms,
-        "admitted_total": state.policy.admitted_total.load(std::sync::atomic::Ordering::Relaxed),
-        "denied_unknown_total": state.policy.denied_unknown_total.load(std::sync::atomic::Ordering::Relaxed),
-        "denied_quota_total": state.policy.denied_quota_total.load(std::sync::atomic::Ordering::Relaxed),
-        "denied_busy_total": state.policy.denied_busy_total.load(std::sync::atomic::Ordering::Relaxed),
+        "admitted_total": state.app.policy.admitted_total.load(std::sync::atomic::Ordering::Relaxed),
+        "denied_unknown_total": state.app.policy.denied_unknown_total.load(std::sync::atomic::Ordering::Relaxed),
+        "denied_quota_total": state.app.policy.denied_quota_total.load(std::sync::atomic::Ordering::Relaxed),
+        "denied_busy_total": state.app.policy.denied_busy_total.load(std::sync::atomic::Ordering::Relaxed),
         "quota": quota_status,
         "uptime_secs": state.started.elapsed().as_secs(),
     }))
@@ -498,7 +595,7 @@ async fn metrics_handler(State(state): State<AdminState>, headers: HeaderMap) ->
         return json_err(StatusCode::UNAUTHORIZED, "unauthorized");
     }
     use std::sync::atomic::Ordering::Relaxed;
-    let snap = state.limiter.snapshot();
+    let snap = state.app.limiter.snapshot();
     let (mut rx, mut txb, mut thr, mut thr_ms) = (0u64, 0u64, 0u64, 0u64);
     for (_, s) in &snap {
         rx += s.rx_bytes;
@@ -523,13 +620,13 @@ async fn metrics_handler(State(state): State<AdminState>, headers: HeaderMap) ->
         &mut out,
         "warden_live_connections",
         "Currently admitted relay connections",
-        state.policy.live_total() as u64,
+        state.app.policy.live_total() as u64,
     );
     gauge(
         &mut out,
         "warden_approved_endpoints",
         "Endpoints currently approved",
-        state.policy.approved_count() as u64,
+        state.app.policy.approved_count() as u64,
     );
     gauge(
         &mut out,
@@ -541,25 +638,25 @@ async fn metrics_handler(State(state): State<AdminState>, headers: HeaderMap) ->
         &mut out,
         "warden_admitted_total",
         "Admission decisions allowing connection (process lifetime)",
-        state.policy.admitted_total.load(Relaxed),
+        state.app.policy.admitted_total.load(Relaxed),
     );
     counter(
         &mut out,
         "warden_denied_unknown_total",
         "Denied: endpoint not approved",
-        state.policy.denied_unknown_total.load(Relaxed),
+        state.app.policy.denied_unknown_total.load(Relaxed),
     );
     counter(
         &mut out,
         "warden_denied_quota_total",
         "Denied: monthly budget exhausted",
-        state.policy.denied_quota_total.load(Relaxed),
+        state.app.policy.denied_quota_total.load(Relaxed),
     );
     counter(
         &mut out,
         "warden_denied_busy_total",
         "Denied: connection ceilings",
-        state.policy.denied_busy_total.load(Relaxed),
+        state.app.policy.denied_busy_total.load(Relaxed),
     );
     counter(
         &mut out,
@@ -585,7 +682,7 @@ async fn metrics_handler(State(state): State<AdminState>, headers: HeaderMap) ->
         "Observed shaping delay",
         thr_ms,
     );
-    if let Some(q) = &state.quota {
+    if let Some(q) = &state.app.quota {
         if let Ok(u) = q.usage().await {
             use std::fmt::Write as _;
             let period = u["period"].as_str().unwrap_or("unknown");
@@ -628,7 +725,7 @@ async fn settings_handler(State(state): State<AdminState>, headers: HeaderMap) -
     if check_auth(&state, &headers, false, None).await.is_err() {
         return json_err(StatusCode::UNAUTHORIZED, "unauthorized");
     }
-    match state.policy.store().get_settings().await {
+    match state.app.policy.store().get_settings().await {
         Ok((settings, version)) => {
             axum::Json(serde_json::json!({ "settings": settings, "version": version }))
                 .into_response()
@@ -660,33 +757,10 @@ async fn settings_patch_handler(
         };
         return json_err(s, msg);
     }
-    match state
-        .policy
-        .store()
-        .patch_settings(body.version, &body.settings)
-        .await
-    {
+    // One coordinator call: atomic commit, then audit, defaults refresh,
+    // limiter propagation, and quota re-evaluation — in that order.
+    match state.app.patch_settings(body.version, &body.settings).await {
         Ok((settings, version)) => {
-            state
-                .policy
-                .store()
-                .append_audit("admin", "settings_patch", "", "")
-                .await;
-            // New ordinary defaults reshape live default-policy limiters.
-            if let Ok(d) = state.policy.refresh_defaults().await {
-                state
-                    .limiter
-                    .apply_all(&state.policy.list(), &d, std::time::Instant::now());
-            }
-            // New budget re-evaluates the ledger (may exhaust or reopen).
-            if let Some(q) = &state.quota {
-                q.refresh().await;
-                state
-                    .policy
-                    .store()
-                    .append_audit("admin", "quota_reevaluated", "", "")
-                    .await;
-            }
             axum::Json(serde_json::json!({ "settings": settings, "version": version }))
                 .into_response()
         }
@@ -708,7 +782,7 @@ async fn audit_handler(
         .and_then(|s| s.parse().ok())
         .unwrap_or(50)
         .clamp(1, 200);
-    match state.policy.store().recent_audit(limit).await {
+    match state.app.policy.store().recent_audit(limit).await {
         Ok(events) => axum::Json(serde_json::json!({ "events": events })).into_response(),
         Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, &e),
     }
@@ -718,7 +792,7 @@ async fn usage_handler(State(state): State<AdminState>, headers: HeaderMap) -> R
     if check_auth(&state, &headers, false, None).await.is_err() {
         return json_err(StatusCode::UNAUTHORIZED, "unauthorized");
     }
-    match &state.quota {
+    match &state.app.quota {
         Some(q) => match q.usage().await {
             Ok(u) => axum::Json(u).into_response(),
             Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, &e),

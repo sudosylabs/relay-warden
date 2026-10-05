@@ -139,30 +139,83 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    let (relay_addr, _relay_handle) = relay::serve(cfg.listen, relay_state)
+    // Supervised shutdown: SIGTERM (systemd's stop signal) and SIGINT both
+    // begin the sequence. Either listener failing on its own also ends the
+    // process loudly (fail-closed, never admin-only) so systemd restarts it.
+    let stop = tokio_util::sync::CancellationToken::new();
+    let relay_listener = tokio::net::TcpListener::bind(cfg.listen)
         .await
-        .map_err(|e| anyhow::anyhow!("relay serve: {e:#}"))?;
-
+        .map_err(|e| anyhow::anyhow!("relay bind: {e:#}"))?;
+    let relay_addr = relay_listener.local_addr()?;
     let admin_state = admin::AdminState::new(policy, limiter.clone(), quota.clone(), token);
     let admin_app = admin::router(admin_state);
     let admin_listener = tokio::net::TcpListener::bind(cfg.admin_listen).await?;
     let admin_addr = admin_listener.local_addr()?;
-    tracing::info!(%relay_addr, %admin_addr, "relay-warden listening (Gate D)");
-    axum::serve(
-        admin_listener,
-        admin_app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(async {
-        let _ = tokio::signal::ctrl_c().await;
-    })
-    .await?;
+    tracing::info!(%relay_addr, %admin_addr, "relay-warden listening");
 
-    // Graceful shutdown: wake throttled tasks, drain relay connections
-    // (returns proven-unspent lease remainders), then stop the ledger actor.
+    // Each server runs supervised: an unexpected end fails the process
+    // loudly (fail-closed, never admin-only) so systemd restarts it.
+    let relay_task = tokio::spawn(relay::serve_graceful_on(
+        relay_listener,
+        relay_state,
+        stop.clone().cancelled_owned(),
+    ));
+    let admin_task = tokio::spawn({
+        let stop = stop.clone();
+        async move {
+            axum::serve(
+                admin_listener,
+                admin_app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(stop.cancelled_owned())
+            .await
+        }
+    });
+    let mut failed = false;
+    tokio::select! {
+        biased;
+        _ = shutdown_signal() => {},
+        r = relay_task => {
+            tracing::error!(?r, "relay listener ended unexpectedly");
+            failed = true;
+        },
+        r = admin_task => {
+            tracing::error!(?r, "admin listener ended unexpectedly");
+            failed = true;
+        },
+    }
+    // Admission closes first (both listeners stop accepting on cancellation),
+    // then clients drain (which also wakes throttled tasks and returns
+    // proven-unspent lease remainders), then the ledger actor confirms every
+    // queued write persisted. Systemd's TimeoutStopSec bounds this sequence.
+    stop.cancel();
     limiter.wake_all();
     relay_clients.shutdown().await;
     if let Some(q) = quota {
         q.shutdown().await;
     }
+    if failed {
+        anyhow::bail!("a listener ended unexpectedly; see logs");
+    }
     Ok(())
+}
+
+/// Completes on Ctrl-C/SIGINT or SIGTERM (systemd stop/restart).
+async fn shutdown_signal() {
+    let ctrl_c = tokio::signal::ctrl_c();
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
 }

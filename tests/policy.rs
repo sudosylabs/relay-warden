@@ -24,13 +24,14 @@ fn upsert(
     speed_policy: Option<&str>,
     revision: Option<i64>,
 ) -> EndpointUpsert {
+    use relay_warden::policy::TriState::Unchanged;
     EndpointUpsert {
         label: label.map(str::to_string),
         approved,
         speed_policy: speed_policy.map(str::to_string),
-        custom_rx_bps: None,
-        custom_tx_bps: None,
-        burst_bytes: None,
+        custom_rx_bps: Unchanged,
+        custom_tx_bps: Unchanged,
+        burst_bytes: Unchanged,
         revision,
     }
 }
@@ -114,7 +115,7 @@ async fn policy_validates_records_and_revisions() {
         .unwrap();
     assert_eq!(rec.speed_policy, SpeedPolicy::Unlimited);
     let mut bad = upsert(None, None, Some("unlimited"), Some(3));
-    bad.custom_rx_bps = Some(1000);
+    bad.custom_rx_bps = relay_warden::policy::TriState::Set(1000);
     assert!(m.upsert(&id, &bad).await.is_err());
 }
 
@@ -212,6 +213,94 @@ async fn policy_revoke_bumps_revision_and_unapproves() {
     let (rec, had_live) = m.revoke(&id).await.unwrap();
     assert!(!rec.approved && !had_live && rec.revision == 2);
     assert!(m.revoke("not-a-key").await.is_err());
+}
+
+#[tokio::test]
+async fn policy_canonicalizes_alternate_id_spellings() {
+    let (m, _g) = manager().await;
+    let id = SecretKey::generate().public();
+    // Base32 spelling of the same key (FromStr accepts hex or base32).
+    let spelled = data_encoding::BASE32_NOPAD.encode(id.as_bytes());
+    assert_ne!(spelled, id.to_string());
+    m.upsert(&spelled, &upsert(Some("alt"), Some(true), None, None))
+        .await
+        .unwrap();
+    // Stored and served under the canonical hex spelling only.
+    let rec = m.get(&id.to_string()).expect("canonical lookup must hit");
+    assert_eq!(rec.endpoint_id, id.to_string());
+    assert_eq!(m.list().len(), 1);
+    // Admission resolves the same record.
+    let req = ClientRequest::new(id, ProtocolVersion::V2, parts());
+    assert!(matches!(m.on_connect(&req).await, Access::Allow));
+}
+
+#[tokio::test]
+async fn policy_concurrent_edits_single_winner_per_revision() {
+    let (m, _g) = manager().await;
+    let id = SecretKey::generate().public().to_string();
+    let original = m
+        .upsert(&id, &upsert(Some("base"), Some(true), None, None))
+        .await
+        .unwrap();
+    let barrier = Arc::new(tokio::sync::Barrier::new(16));
+    let mut tasks = Vec::new();
+    for i in 0..16 {
+        let m = m.clone();
+        let id = id.clone();
+        let barrier = barrier.clone();
+        tasks.push(tokio::spawn(async move {
+            barrier.wait().await;
+            m.upsert(
+                &id,
+                &upsert(
+                    Some(&format!("edit-{i}")),
+                    None,
+                    None,
+                    Some(original.revision),
+                ),
+            )
+            .await
+            .is_ok()
+        }));
+    }
+    let mut successes = 0;
+    for t in tasks {
+        if t.await.unwrap() {
+            successes += 1;
+        }
+    }
+    assert_eq!(
+        successes, 1,
+        "{successes} edits succeeded against the same revision"
+    );
+    // The winning row is coherent: exactly one label at revision 2.
+    let rec = m.get(&id).unwrap();
+    assert_eq!(rec.revision, 2);
+}
+
+#[test]
+fn policy_custom_limits_clear_to_unlimited() {
+    use relay_warden::policy::{apply_upsert, EndpointUpsert};
+    let id = SecretKey::generate().public().to_string();
+    let custom: EndpointUpsert =
+        serde_json::from_value(serde_json::json!({"speed_policy":"custom","custom_rx_bps":1000}))
+            .unwrap();
+    let record = apply_upsert(None, &id, &custom).unwrap();
+    // Explicit nulls clear; omitted fields would leave the cap in place.
+    let unlimited: EndpointUpsert = serde_json::from_value(
+        serde_json::json!({"revision":record.revision,"speed_policy":"unlimited","custom_rx_bps":null,"custom_tx_bps":null}),
+    )
+    .unwrap();
+    assert!(
+        apply_upsert(Some(&record), &id, &unlimited).is_ok(),
+        "cannot clear a custom cap to make device unlimited"
+    );
+    // ...while omitting the rates really does leave them (and then fails).
+    let stuck: EndpointUpsert = serde_json::from_value(
+        serde_json::json!({"revision":record.revision,"speed_policy":"unlimited"}),
+    )
+    .unwrap();
+    assert!(apply_upsert(Some(&record), &id, &stuck).is_err());
 }
 
 #[tokio::test]

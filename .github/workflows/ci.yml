@@ -1,0 +1,19 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/rustup@v1
+        with:
+          toolchain: 1.91.0
+          components: rustfmt, clippy
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: admin UI syntax
+        run: python3 -c "import re; s=open('src/admin.rs').read(); open('/tmp/admin_ui.js','w').write(re.search(r'<script>\n(.*)\n</script>', s, re.DOTALL).group(1))" && node --check /tmp/admin_ui.js
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test

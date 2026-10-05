@@ -1,8 +1,10 @@
 //! relay-warden: private Iroh relay library.
 //!
-//! Gate A: minimal embedding of `iroh-relay` public APIs behind an Axum
-//! frontend. Gate B: SQLite policy + live revocation + private admin.
-//! Gate C: shared per-endpoint throughput enforcement.
+//! Axum frontend embedding public `iroh-relay` APIs, with SQLite-backed
+//! endpoint policy and live revocation, a private admin API, shared
+//! per-endpoint throughput enforcement, and a durable monthly outbound
+//! budget. See `docs/DESIGN.md` for the architecture and `docs/ACCEPTANCE.md`
+//! for the requirement mapping.
 
 pub mod access;
 pub mod admin;
@@ -11,4 +13,5 @@ pub mod limiter;
 pub mod policy;
 pub mod quota;
 pub mod relay;
+pub mod service;
 pub mod store;

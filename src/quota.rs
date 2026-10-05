@@ -185,14 +185,15 @@ enum QuotaMsg {
         reply: oneshot::Sender<AcquireReply>,
     },
     /// Proven-unspent lease remainder (clean connection close only).
-    Return {
-        bytes: u64,
-    },
+    /// Carries the lease generation so a stale refund can never reduce the
+    /// wrong month's ledger; mismatched refunds are dropped (the bytes stay
+    /// charged in their original period: conservative).
+    Return { bytes: u64, generation: u64 },
     /// Re-read settings + re-evaluate (budget change, explicit refresh).
-    Refresh {
-        reply: oneshot::Sender<()>,
-    },
-    Shutdown,
+    Refresh { reply: oneshot::Sender<()> },
+    /// Stop the actor after all queued messages. The reply confirms every
+    /// prior grant/return was persisted before shutdown completes.
+    Shutdown { done: oneshot::Sender<()> },
 }
 
 #[derive(Debug)]
@@ -273,9 +274,11 @@ impl QuotaClient {
 
     /// Hand back a proven-unspent remainder. Best effort: if the channel is
     /// full or the actor is gone, the bytes stay charged (conservative).
-    pub fn return_unused(&self, bytes: u64) {
+    /// The lease `generation` must match the granting period; the actor
+    /// drops stale refunds instead of reducing the wrong ledger.
+    pub fn return_unused(&self, bytes: u64, generation: u64) {
         if bytes > 0 {
-            let _ = self.tx.try_send(QuotaMsg::Return { bytes });
+            let _ = self.tx.try_send(QuotaMsg::Return { bytes, generation });
         }
     }
 }
@@ -299,6 +302,14 @@ impl QuotaManager {
         let cfg = QuotaConfig::from_settings(&settings);
         cfg.validate_patch()?;
         let month = clock.month();
+        // Adopt the newest durable ledger when it is ahead of the wall
+        // clock: forward-only protection must survive restarts, so a
+        // backward clock can never reopen spent quota as an empty ledger.
+        let start_month = match store.latest_period().await? {
+            Some(latest) if latest > month => latest,
+            _ => month,
+        };
+        let month = start_month;
         let row = store.open_period(&month).await?;
         // Derive exhaustion from the ledger itself: a crash between the
         // in-memory flag and a prior persist must not reopen the relay.
@@ -377,9 +388,15 @@ impl QuotaManager {
         matches!(rx.await, Ok(AcquireReply::Granted { .. }))
     }
 
-    /// Clean shutdown of the ledger actor.
+    /// Clean shutdown of the ledger actor. Awaits confirmation that every
+    /// queued grant and return was persisted — shutdown never truncates the
+    /// ledger. Returns immediately if the actor is already gone.
     pub async fn shutdown(&self) {
-        let _ = self.tx.send(QuotaMsg::Shutdown).await;
+        let (tx, rx) = oneshot::channel();
+        if self.tx.send(QuotaMsg::Shutdown { done: tx }).await.is_err() {
+            return;
+        }
+        let _ = rx.await;
     }
 
     pub async fn usage(&self) -> Result<serde_json::Value, String> {
@@ -405,7 +422,7 @@ impl QuotaManager {
                 "webhook_configured": cfg.alert_webhook_url.is_some(),
                 "last_delivery": self.shared.last_delivery.read().expect("lock").clone(),
             },
-            "uncertainty_note": "Charged bytes are relay payload + overhead allowance counted at send admission, not Oracle billable bytes. In-flight kernel/proxy bytes admitted before exhaustion cannot be recalled; bound ~= connections x (chunk + max frame).",
+            "uncertainty_note": "Charged bytes are relay payload + overhead allowance counted at send admission, not Oracle billable bytes. Every forwarded frame is fully reserved before send, so delivered bytes cannot exceed the cutoff; bytes already in kernel/proxy buffers at exhaustion were all granted beforehand.",
         }))
     }
 }
@@ -438,7 +455,13 @@ async fn run_actor(
                             AcquireReply::Denied
                         });
                     }
-                    QuotaMsg::Return { bytes } => {
+                    QuotaMsg::Return { bytes, generation } => {
+                        // Apply only to the generation that granted the lease.
+                        // A refund from an older period is dropped, not
+                        // subtracted from the current ledger.
+                        if generation != shared.generation.load(Ordering::Relaxed) {
+                            continue;
+                        }
                         // Mirror follows the commit: on storage failure the
                         // return is dropped and the bytes stay charged
                         // (fail-closed, conservative).
@@ -452,7 +475,10 @@ async fn run_actor(
                         reevaluate(&shared, &mut st).await;
                         let _ = reply.send(());
                     }
-                    QuotaMsg::Shutdown => break,
+                    QuotaMsg::Shutdown { done } => {
+                        let _ = done.send(());
+                        break;
+                    }
                 }
             }
             _ = tick.tick() => {

@@ -73,7 +73,7 @@ async fn store_endpoint_rows_roundtrip() {
     let (store, _guard) = open_named("endpoints").await;
     let mut e = EndpointPolicy::new("id-1".into(), "one".into());
     e.approved = true;
-    store.upsert_endpoint(&e).await.unwrap();
+    store.upsert_endpoint_cas(&e, None).await.unwrap();
     let all = store.list_endpoints().await.unwrap();
     assert_eq!(all.len(), 1);
     assert!(all[0].approved);
@@ -108,6 +108,20 @@ async fn store_quota_ledger_math() {
     // History is never deleted by opening new periods.
     store.open_period("2026-04").await.unwrap();
     assert!(store.read_period("2026-03").await.unwrap().exhausted);
+}
+
+#[tokio::test]
+async fn store_rejected_patch_commits_nothing() {
+    let (store, _guard) = open_named("atomic").await;
+    let (before, version) = store.get_settings().await.unwrap();
+    // Valid speed change + invalid budget: the whole patch must fail.
+    let mut patch = serde_json::Map::new();
+    patch.insert("default_rx_bps".into(), 2_000.into());
+    patch.insert("quota_budget_bytes".into(), (-1).into());
+    assert!(store.patch_settings(version, &patch).await.is_err());
+    let (after, new_version) = store.get_settings().await.unwrap();
+    assert_eq!(new_version, version, "rejected patch bumped the version");
+    assert_eq!(after, before, "rejected patch committed some settings");
 }
 
 #[tokio::test]

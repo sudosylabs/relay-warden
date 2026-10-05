@@ -140,22 +140,41 @@ fn negotiate_version(offered: Option<&HeaderValue>) -> Option<ProtocolVersion> {
     }
 }
 
-async fn serve_inner(
-    listener: TcpListener,
-    state: RelayState,
-) -> n0_error::Result<AbortOnDropHandle<()>> {
-    let router = Router::new()
+fn router(state: RelayState) -> Router {
+    Router::new()
         .route(RELAY_PATH, get(relay_handler))
         .route(RELAY_PROBE_PATH, get(ping_handler))
         .route("/healthz", get(health_handler))
         .route("/", get(root_handler))
-        .with_state(state);
+        .with_state(state)
+}
+
+async fn serve_inner(
+    listener: TcpListener,
+    state: RelayState,
+) -> n0_error::Result<AbortOnDropHandle<()>> {
     let task = tokio::spawn(async move {
-        if let Err(e) = axum::serve(listener, router.into_make_service()).await {
+        if let Err(e) = axum::serve(listener, router(state).into_make_service()).await {
             warn!("axum serve error: {e:#}");
         }
     });
     Ok(AbortOnDropHandle::new(task))
+}
+
+/// Serve on an already-bound listener until `shutdown` resolves, then stop
+/// accepting. Returned for supervision: an `Err` means the listener itself
+/// failed, which must take the process down (fail-closed, never
+/// admin-only). In-flight relay connections are drained separately by the
+/// caller via `Clients::shutdown`, since graceful HTTP shutdown alone would
+/// wait on never-closing WebSockets forever.
+pub async fn serve_graceful_on(
+    listener: TcpListener,
+    state: RelayState,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> std::io::Result<()> {
+    axum::serve(listener, router(state).into_make_service())
+        .with_graceful_shutdown(shutdown)
+        .await
 }
 
 /// Bind loopback (or configured) address and serve. Returns bound addr + task.
@@ -382,6 +401,10 @@ impl AxumWebSocketAdapter {
         if !self.throttling {
             return Poll::Ready(());
         }
+        // Largest charge any single forwarded frame can require: no frame is
+        // sent unless its complete charge is already reserved (fail-closed),
+        // so readiness requires covering the biggest forwardable frame.
+        let need = q.charge_for(iroh_relay::MAX_PACKET_SIZE) as i64;
         loop {
             if q.exhausted() {
                 // Parked: exhaustion disconnects all connections, which drops
@@ -396,7 +419,7 @@ impl AxumWebSocketAdapter {
                 self.quota_gen = q.generation();
                 self.quota_pending = None;
             }
-            if self.quota_lease > 0 {
+            if self.quota_lease >= need {
                 self.quota_sleep = None;
                 return Poll::Ready(());
             }
@@ -462,11 +485,12 @@ impl Drop for AxumWebSocketAdapter {
         if let Some(lim) = &self.limiter {
             lim.unsubscribe(self.wait_id);
         }
-        // Hand back the proven-unspent lease remainder. Best effort: if the
-        // actor is gone the bytes stay charged (conservative, fail-closed).
+        // Hand back the proven-unspent lease remainder, tagged with its
+        // granting generation. Best effort: if the actor is gone the bytes
+        // stay charged (conservative, fail-closed).
         if let Some(q) = &self.quota {
             if self.quota_lease > 0 {
-                q.return_unused(self.quota_lease as u64);
+                q.return_unused(self.quota_lease as u64, self.quota_gen);
             }
         }
     }
@@ -560,13 +584,15 @@ impl Sink<Bytes> for AxumWebSocketAdapter {
                 }
             }
             if let Some(q) = self.quota.clone() {
-                // Charged bytes leave the lease (bounded debt allowed, as
-                // with the throughput buckets). The grant was already
-                // committed durably; this frame was admitted by it.
+                // The full charge was reserved before this frame was accepted
+                // (see poll_quota): deduct, never overdraw.
                 self.quota_lease -= q.charge_for(item.len()) as i64;
-                // Top up proactively so the next frame rarely waits for a
-                // round trip. At most one refill is outstanding.
-                if self.quota_lease <= 0 && self.quota_pending.is_none() {
+                debug_assert!(self.quota_lease >= 0, "quota lease overdrawn");
+                // Top up proactively once the lease no longer covers another
+                // maximal frame, so the next frame rarely waits for a round
+                // trip. At most one refill is outstanding.
+                let need = q.charge_for(iroh_relay::MAX_PACKET_SIZE) as i64;
+                if self.quota_lease < need && self.quota_pending.is_none() {
                     if let Some(rx) = q.try_acquire() {
                         self.quota_pending = Some(rx);
                     }

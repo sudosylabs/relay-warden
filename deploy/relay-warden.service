@@ -10,7 +10,21 @@ Group=relay-warden
 ExecStart=/opt/relay-warden/relay-warden --config /etc/relay-warden/warden.toml
 Restart=on-failure
 RestartSec=5
-# Bounded logs and resource ceilings (tune to the host).
+# Bounded logs and resource ceilings (tune to the host). This host is shared
+# with future applications: cap the relay well below total capacity so one
+# service cannot starve the others. The relay itself enforces connection,
+# throughput, and budget limits; these OS ceilings are the backstop.
+MemoryMax=1G
+CPUQuota=100%
+TasksMax=256
+LogRateLimitIntervalSec=10s
+LogRateLimitBurst=200
+# Graceful shutdown drains connections and confirms ledger persistence;
+# bound it so a stuck drain cannot delay restarts forever.
+TimeoutStopSec=30
+# SIGTERM (the default stop signal) is handled by the binary and begins the
+# drain sequence; a listener failure exits nonzero so this unit restarts.
+KillSignal=SIGTERM
 StandardOutput=journal
 StandardError=journal
 NoNewPrivileges=true

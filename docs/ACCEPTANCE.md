@@ -65,6 +65,26 @@ deployment-dependent check. Deployment itself is a separate authorized phase.
 4. Connection `Config` rate-limit notify is internal → own counters; stock client-visible status not reproduced.
 5. Axum path negotiates V1+V2 honestly; integration traffic uses V2 (client default). V1 client interop is a **deployment check** with the intended client versions.
 
+## Review hardening (independent review, all addressed)
+
+| Finding | Fix | Test |
+|---|---|---|
+| Frames spent unreserved bytes (12 KiB vs 1 KiB budget) | Full frame charge reserved before send; leases never overdraw | `tests/quota.rs::quota_large_frame_fully_reserved_before_send`, `quota_oversize_frame_cannot_spend_beyond_budget` |
+| Old-month refunds reduced the new ledger | Generation-tagged refunds; stale generations dropped | `tests/quota.rs::quota_old_lease_refund_cannot_reduce_new_month` |
+| Backward clock + restart reopened spent quota | Startup adopts the latest durable ledger | `tests/quota.rs::quota_restart_after_rollback_keeps_latest_ledger` |
+| Concurrent edits bypassed revision protection | Single-statement CAS + cache refresh on conflict | `tests/policy.rs::policy_concurrent_edits_single_winner_per_revision` |
+| Rejected settings patches partially persisted | Validate-all then one transaction | `tests/store.rs::store_rejected_patch_commits_nothing` |
+| Admin page JS broken, no management controls | Rebuilt UI (node syntax-checked) with approve/revoke/edit/settings/usage/audit | `tests/admin.rs::admin_page_serves_working_management_ui` + node `--check` in CI step |
+| Custom caps could not clear to unlimited | Tri-state fields (omit/null/set) | `tests/policy.rs::policy_custom_limits_clear_to_unlimited` |
+| Rollback restored spent allowance | Binary-only rollback; reconciliation procedure | `docs/OPERATIONS.md` Rollback (+ `user_version` fail-closed guard) |
+| Alternate ID spellings bypassed admission | Canonical hex at the domain boundary | `tests/policy.rs::policy_canonicalizes_alternate_id_spellings` |
+| Settings orchestration scattered in handler | `service::App` coordinator | `tests/admin.rs` suite exercises every path through it |
+| SQLite blocked runtime workers | All DB work on the blocking pool | Structural; full suite green under it |
+| SIGTERM bypassed graceful shutdown | SIGTERM+SIGINT handling, ordered drain, acked ledger stop | Structural + `deploy/relay-warden.service` (`KillSignal`, `TimeoutStopSec`) |
+| Incomplete shutdown order | Listeners close first, then drain, then acked persistence | Structural |
+| Unsupervised listener failure | Both servers supervised; failure exits loudly for restart | Structural |
+| Missing OS resource ceilings | Memory/CPU/tasks/journal ceilings in the unit | `deploy/relay-warden.service` |
+
 ## Unresolved production choices (operator must confirm pre-deploy)
 
 - Production speed values (ordinary defaults, per-endpoint customs).

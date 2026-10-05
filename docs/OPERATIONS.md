@@ -50,18 +50,43 @@ session cookie + CSRF token.
 - Backup: stop the service (or accept a WAL-checkpointed copy) and copy
   `warden.db` (plus `-wal`/`-shm` if present) to versioned storage.
 - Restore replaces the ledger: **re-verify endpoint approvals afterwards**,
-  because a restore reverts later revocations. Restoring never creates
-  spendable quota (spent bytes stay spent; exhaustion flags persist).
+  because a restore reverts later revocations. A restore also reverts
+  *usage*: spent bytes disappear and exhaustion flags clear, which recreates
+  spendable allowance. Never restore a database over a live ledger — see
+  Rollback for the reconciliation procedure.
 - A database stamped with a newer `user_version` is refused by older
   binaries (fail-closed); upgrade the binary, never hand-edit the DB.
 
 ## Upgrade
 
 1. Snapshot `warden.db` (recoverable backup of the exact files replaced).
-2. Stop the service, replace the binary, restart.
+2. Stop the service (`systemctl stop`: SIGTERM drains connections and
+   confirms ledger persistence, bounded by `TimeoutStopSec=30`), replace the
+   binary, restart.
 3. Check `/admin/status` (`db_ok`, period, exhaustion) and relay transfer.
-4. Rollback: stop, restore the binary **and** the pre-upgrade DB snapshot
-   together (never mix a new ledger with an old binary), restart, re-verify.
+
+## Rollback (binary only — never restore an old database over a live ledger)
+
+Restoring a pre-upgrade DB snapshot would delete usage recorded since the
+snapshot and resurrect spent allowance, contradicting the durability
+guarantee. Roll back the **binary only** and keep the current database:
+
+1. `systemctl stop relay-warden`.
+2. Reinstall the previous release binary (keep a copy of each deployed
+   binary with its version).
+3. Start and verify: `/admin/usage` must show the same `charged_bytes` and
+   `exhausted` state as before the rollback.
+4. If the old binary refuses to start with `database schema generation …
+   is newer`, the schema moved forward: do **not** force the old database
+   back. Either stay on the new binary (forward-fix) or reconcile
+   explicitly — carry every period's `charged_bytes` and `exhausted`
+   forward (taking the maximum of backup and live values), e.g.:
+   `sqlite3 live.db "ATTACH 'backup.db' AS b; UPDATE quota_periods SET
+   charged_bytes = max(charged_bytes, (SELECT charged_bytes FROM
+   b.quota_periods WHERE period = quota_periods.period)), exhausted =
+   exhausted OR (SELECT exhausted FROM b.quota_periods WHERE period =
+   quota_periods.period));"`
+   then re-verify `charged_bytes`/`exhausted` before opening traffic.
    Never fall back to an unrestricted relay binary: a failed custom server
    stays down, loud, rather than silently open.
 

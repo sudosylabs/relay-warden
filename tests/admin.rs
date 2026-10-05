@@ -343,6 +343,38 @@ async fn admin_metrics_are_bounded() {
 }
 
 #[tokio::test]
+async fn admin_page_serves_working_management_ui() {
+    let h = start(HarnessOptions::default()).await;
+    // The page shell itself needs no auth (all data loads via the API).
+    let body = reqwest::Client::new()
+        .get(format!("http://{}/admin/", h.admin_addr))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    // Must parse as JavaScript: extract and check with node at test time is
+    // heavyweight; assert the structural markers of the fixed script instead.
+    assert!(!body.contains("{{"), "doubled braces leak into served JS");
+    for marker in [
+        "addBtn",
+        "loginBtn",
+        "logoutBtn", // wiring (no inline onclick)
+        "Revoke",
+        "Save settings",
+        "Add endpoint",
+        "Monthly budget",
+        "encodeURIComponent",
+        "textContent",
+        "X-CSRF-Token",
+    ] {
+        assert!(body.contains(marker), "UI missing control {marker}");
+    }
+    assert!(!body.contains("innerHTML"), "UI must not use innerHTML");
+}
+
+#[tokio::test]
 async fn admin_rejects_oversize_bodies() {
     let h = start(HarnessOptions::default()).await;
     let big = "x".repeat(100_000);
