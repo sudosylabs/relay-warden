@@ -1,0 +1,74 @@
+{
+  "asn1-rs-impl@0.2.0": {
+    "file": "licenses/dependencies/asn1-rs-impl-0.2.0.txt",
+    "source": "https://raw.githubusercontent.com/rusticata/asn1-rs/a20e5f7319c896737ad0f2557037817b91ad854f/LICENSE-MIT",
+    "source_commit": "a20e5f7319c896737ad0f2557037817b91ad854f",
+    "selection": "MIT"
+  },
+  "iroh-base@1.3.0": {
+    "file": "licenses/dependencies/iroh-base-1.3.0.txt",
+    "source": "https://raw.githubusercontent.com/n0-computer/iroh/0072d7d84b233f9e7185eb676f049beaf557ac03/LICENSE-MIT",
+    "source_commit": "0072d7d84b233f9e7185eb676f049beaf557ac03",
+    "selection": "MIT"
+  },
+  "iroh-dns@1.3.0": {
+    "file": "licenses/dependencies/iroh-dns-1.3.0.txt",
+    "source": "https://raw.githubusercontent.com/n0-computer/iroh/17c0612f80f78f5288e97b818b1360ae6ea0a51a/LICENSE-MIT",
+    "source_commit": "17c0612f80f78f5288e97b818b1360ae6ea0a51a",
+    "selection": "MIT"
+  },
+  "iroh-metrics-derive@1.0.1": {
+    "file": "licenses/dependencies/iroh-metrics-derive-1.0.1.txt",
+    "source": "https://raw.githubusercontent.com/n0-computer/iroh-metrics/a9afb7cd49bb3804fffefec61647993851f9b8c8/LICENSE-MIT",
+    "source_commit": "a9afb7cd49bb3804fffefec61647993851f9b8c8",
+    "selection": "MIT"
+  },
+  "n0-error-macros@1.0.1": {
+    "file": "licenses/dependencies/n0-error-macros-1.0.1.txt",
+    "source": "https://raw.githubusercontent.com/n0-computer/n0-error/596f4113918712d545cbb25b7fa12c7153706f54/LICENSE-MIT",
+    "source_commit": "596f4113918712d545cbb25b7fa12c7153706f54",
+    "selection": "MIT"
+  },
+  "enum-assoc@1.4.1": {
+    "file": "licenses/dependencies/Apache-2.0.txt",
+    "source": "https://raw.githubusercontent.com/Eolu/enum-assoc/351b306939b150601451df752a183b077b0de85a/Cargo.toml",
+    "source_commit": "351b306939b150601451df752a183b077b0de85a",
+    "selection": "Apache-2.0",
+    "note": "Published source and upstream commit omit licence texts. Manifest grants MIT OR Apache-2.0; select Apache-2.0 and include its unmodified canonical text. Author: Griffin O'Neill. No upstream NOTICE file exists in this revision."
+  },
+  "reloadable-core@0.1.0": {
+    "file": "licenses/dependencies/MIT.txt",
+    "source": "https://raw.githubusercontent.com/MOZGIII/rustls-cert-utils/369e42a96a0f52610ed1fed007fce8ac03e07ba9/crates/reloadable-core/Cargo.toml",
+    "source_commit": "369e42a96a0f52610ed1fed007fce8ac03e07ba9",
+    "selection": "MIT",
+    "note": "Upstream manifest declares MIT but this published source and repository revision contain no licence text or copyright notice. Include the unmodified SPDX MIT template; do not invent ownership. Review this attribution exception before a public release."
+  },
+  "reloadable-state@0.1.0": {
+    "file": "licenses/dependencies/MIT.txt",
+    "source": "https://raw.githubusercontent.com/MOZGIII/rustls-cert-utils/369e42a96a0f52610ed1fed007fce8ac03e07ba9/crates/reloadable-state/Cargo.toml",
+    "source_commit": "369e42a96a0f52610ed1fed007fce8ac03e07ba9",
+    "selection": "MIT",
+    "note": "Upstream manifest declares MIT but this published source and repository revision contain no licence text or copyright notice. Include the unmodified SPDX MIT template; do not invent ownership. Review this attribution exception before a public release."
+  },
+  "rustls-cert-file-reader@0.4.2": {
+    "file": "licenses/dependencies/MIT.txt",
+    "source": "https://raw.githubusercontent.com/MOZGIII/rustls-cert-utils/d7a45045b1bb03d86ddf00ce8bd0b1e8520a1456/crates/rustls-cert-file-reader/Cargo.toml",
+    "source_commit": "d7a45045b1bb03d86ddf00ce8bd0b1e8520a1456",
+    "selection": "MIT",
+    "note": "Upstream manifest declares MIT but this published source and repository revision contain no licence text or copyright notice. Include the unmodified SPDX MIT template; do not invent ownership. Review this attribution exception before a public release."
+  },
+  "rustls-cert-read@0.3.0": {
+    "file": "licenses/dependencies/MIT.txt",
+    "source": "https://raw.githubusercontent.com/MOZGIII/rustls-cert-utils/d549c2272f2faa5edca935a1501790fb8ed46aa7/crates/rustls-cert-read/Cargo.toml",
+    "source_commit": "d549c2272f2faa5edca935a1501790fb8ed46aa7",
+    "selection": "MIT",
+    "note": "Upstream manifest declares MIT but this published source and repository revision contain no licence text or copyright notice. Include the unmodified SPDX MIT template; do not invent ownership. Review this attribution exception before a public release."
+  },
+  "rustls-cert-reloadable-resolver@0.7.1": {
+    "file": "licenses/dependencies/MIT.txt",
+    "source": "https://raw.githubusercontent.com/MOZGIII/rustls-cert-utils/239c34ff86da418948f3f85c0de448762bdf5ab2/crates/rustls-cert-reloadable-resolver/Cargo.toml",
+    "source_commit": "239c34ff86da418948f3f85c0de448762bdf5ab2",
+    "selection": "MIT",
+    "note": "Upstream manifest declares MIT but this published source and repository revision contain no licence text or copyright notice. Include the unmodified SPDX MIT template; do not invent ownership. Review this attribution exception before a public release."
+  }
+}

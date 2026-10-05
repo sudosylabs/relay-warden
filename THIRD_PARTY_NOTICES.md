@@ -4,6 +4,11 @@ Relay Warden's original code is Apache-2.0 (Sudosy Labs contributors),
 see `LICENSE-APACHE`. This file lists linked third-party crates from
 `Cargo.lock` plus additional notices that a manifest scan cannot see.
 
+Release archives also include `DEPENDENCY_LICENSES.txt`: original licence
+and notice files collected from the locked target dependency sources by
+`scripts/dependency-licenses.py`. That bundle includes build/test dependencies
+and nested vendored notices; this table alone is not a licence-text bundle.
+
 ## Additional notices (reviewed, not scanner-generated)
 
 - `iroh-relay` (n0-computer/iroh v1.3.0, MIT OR Apache-2.0): portions of
