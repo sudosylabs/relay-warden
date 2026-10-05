@@ -1,67 +1,104 @@
 # Releasing
 
-How a maintainer prepares, tags, verifies, and publishes a release. No
-release is published, and no tag created, without explicit authorization;
-the workflow below stages everything as a draft first.
+Releases contain native Linux x86-64 and ARM64 binaries. Tag pushes stage
+a **draft**; a maintainer reviews it and publishes it manually. Manual
+workflow runs only build and test. Neither workflow deploys a service.
 
-## Versioning
+## Prepare a version
 
-SemVer, one package version in `Cargo.toml`. Tag form is `v<version>`
-(e.g. `v0.1.0`); prerelease tags (`-rc.1`, …) publish as GitHub
-prereleases. The release workflow refuses tags that do not match
-`Cargo.toml`.
+1. Update `Cargo.toml` and `Cargo.lock` together. Use a version such as
+   `0.1.0` or `0.1.0-rc.1`.
+2. Regenerate the dependency inventory with `bash scripts/gen-notices.sh`.
+   Review licence changes and any copied upstream code.
+3. Run `bash scripts/check.sh` and test a package as described below.
+4. Commit the change to `main`, push it, and wait for the `verify` check.
+5. Once ready to create a release, tag that commit with `v<version>`
+   and push that tag. A signed tag is preferable if you have a signing key.
 
-## Prepare
+Tag creation and pushing are maintainer actions, not part of local testing.
 
-1. Bump `version` in `Cargo.toml` (and `Cargo.lock`), regenerate
-   `THIRD_PARTY_NOTICES.md` (`scripts/gen-notices.sh`), review the diff.
-2. Update release notes with user-visible changes and migration caveats.
-3. Commit, push to the default branch, wait for CI green.
-4. Tag the release commit: `git tag -s v0.1.0` (or annotated without `-s`
-   if the maintainer has no signing key configured).
+## What runs
 
-## What the release workflow does
+The [release workflow](../.github/workflows/release.yml) has three stages:
 
-On `v*` tags (plus a manual build-only dry run):
+1. **Validate:** pin the event commit, check that a tag matches the package
+   version and belongs to `main` history, and lint the workflow files.
+2. **Build:** on Ubuntu 24.04 x86-64 and ARM64, run the same checks as CI,
+   build the server and test client, package them, inspect the archive, and
+   run the extracted server with fresh state and real relayed traffic.
+3. **Publish:** download the two named artifacts from this run, check their
+   source/version/target metadata and checksums, collect a single
+   `SHA256SUMS`, and upload the archives and manifest to a draft release.
 
-1. Validates the tag and checks it out exactly, recording its SHA.
-2. Re-runs the full verification (fmt, clippy, tests, UI check) at that SHA.
-3. Builds natively per target: `x86_64-unknown-linux-gnu` and
-   `aarch64-unknown-linux-gnu`, with the locked toolchain and `--locked`
-   dependencies.
-4. Packages each target with `scripts/package.sh` (binary, config/systemd/
-   proxy examples, `INSTALL.md`, licences, reviewed notices, `BUILD.txt`),
-   checksums `SHA256SUMS`, and verifies archive contents after extraction.
-5. Smoke-tests each extracted archive: `--help`/`--version`, boot from a
-   fresh temp config, denied unauthenticated admin, authenticated
-   health/status, and a real approved relayed transfer.
-6. A single publisher job (the only `contents: write` holder) stages a
-   **draft** release with exactly those assets. It goes public only after a
-   maintainer checks the draft.
+Both builds must pass. Only the publisher has `contents: write`.
+CI cancels obsolete runs for the same PR or ref. Releases use a separate
+per-ref concurrency group and do not cancel an active publisher.
 
-Reruns resume the same unpublished draft or fail with a conflict; published
-releases and assets are never overwritten, and tags are never moved.
-Interrupted runs leave no advertised partial release. See
-`.github/workflows/release.yml`.
+The ARM64 job requires an available `ubuntu-24.04-arm` runner. Confirm
+availability before the first hosted run. Do not substitute the production
+server as a build runner.
 
-## Baselines
+## Package contents and support
 
-Release runners are current Ubuntu images (glibc 2.39+ on 24.04; the exact
-baseline is recorded in each run's `BUILD.txt` environment notes). The
-binaries are dynamically linked against the runner glibc and target the
-same major distributions — they are not static/musl builds and are not
-claimed to run on older or musl-based systems.
+Each archive contains the executable, configuration and proxy examples,
+the systemd unit, installation/operations/configuration/API guides,
+project and upstream licences, `DEPENDENCY_LICENSES.txt`, and `BUILD.json`.
 
-## Dry run locally
+Builds use Ubuntu 24.04 and dynamically linked GNU/Linux targets:
+`x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu`. Ubuntu 24.04
+is the intended tested baseline, not a promise of compatibility with every
+distribution using glibc 2.39. The build metadata records the actual
+platform, libc, target, toolchain and commit. Alpine/musl and older glibc
+systems are not supported by these archives.
+Local uncommitted changes are marked `dirty` in the metadata. Such archives
+can be tested locally but are rejected by the release collector/publisher.
 
-`scripts/package.sh` is pure staging logic and runs anywhere; give it a
-locally built binary directory and any target label for a drill (archives
-from a drill are labelled as such and must never be published):
+The licence bundle includes original licence/notice files from the locked
+target graph, including nested vendored notices and build/test dependencies.
+Extra entries are intentional. Review it when dependencies change; automated
+collection is not a legal audit.
 
-```bash
-cargo build --locked --release
-VERSION=0.1.0 TARGET="$(rustc -vV | sed -n 's/host: //p')"
-bash scripts/package.sh "$VERSION" "$TARGET" target/release /tmp/warden-dist
-bash scripts/smoke.sh /tmp/warden-dist/relay-warden-v*.tar.gz \
-  target/debug/examples/relayed_transfer
+Versioned exceptions are in [dependency-overrides.json](../licenses/dependency-overrides.json).
+Most recover texts from the exact upstream commit recorded in the crate.
+The `enum-assoc` and `rustls-cert-utils` revisions omit licence texts entirely:
+their bundles use the declared Apache/MIT branch and canonical licence text,
+without inventing copyright owners. Review these attribution exceptions
+before making a public release.
+
+## Local package test
+
+From the repository root, with Python 3.11+ installed:
+
+```sh
+cargo build --locked --release --bin relay-warden --example relayed_transfer
+VERSION="$(python3 scripts/release.py metadata | sed -n 's/^version=//p')"
+TARGET="$(rustc -vV | sed -n 's/host: //p')"
+WARDEN_DIST="$(mktemp -d)"
+bash scripts/package.sh "$VERSION" "$TARGET" target/release "$WARDEN_DIST"
+bash scripts/smoke.sh "$WARDEN_DIST/relay-warden-v$VERSION-$TARGET.tar.gz" \
+  target/release/examples/relayed_transfer
 ```
+
+Packaging requires a matching native target. A macOS drill produces a
+macOS-labelled archive, not a Linux release. Only the two Linux targets
+are accepted by the release collector.
+
+The smoke test checks help/version, server startup, denied unauthenticated
+admin access, authenticated status/metrics and an approved bidirectional
+transfer. All listeners are loopback. It does not prove public HTTPS or
+browser interaction works.
+
+## Draft review and retries
+
+Review the source commit, both archives, checksum manifest and run results.
+Add user-visible release notes and upgrade caveats, then publish through
+GitHub's release UI. Checksums detect corruption; they are not signatures.
+
+An interrupted upload leaves a draft. Rerunning can replace assets only in
+an unpublished draft bearing the same source commit. Published releases
+and different-source drafts are refused; tags are never moved. If a draft
+has unexpected assets, resolve that conflict manually before publishing.
+
+Repository environments and branch protection must be configured by a
+maintainer. Require the CI `verify` check. No hosted run, runner support,
+or published release should be claimed until that action actually succeeds.

@@ -1,17 +1,10 @@
-# Release pipeline: version tags (`v*`) produce tested Linux binaries.
-# Manual dispatch is a build-only dry run by default and never publishes.
-# Action pins are recorded in ci.yml; the same SHAs apply here.
 name: release
 
 on:
   push:
-    tags: ["v*"]
+    tags: ['v*']
+  # Manual runs build and test only; they never create a release.
   workflow_dispatch:
-    inputs:
-      dry_run:
-        description: "Build, package and smoke-test without publishing"
-        type: boolean
-        default: true
 
 concurrency:
   group: release-${{ github.ref }}
@@ -22,7 +15,7 @@ permissions:
 
 jobs:
   validate:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
       version: ${{ steps.meta.outputs.version }}
@@ -31,71 +24,69 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ github.ref }}
+          ref: ${{ github.sha }}
+          fetch-depth: 0
           persist-credentials: false
-      - id: meta
+      - name: Validate workflows
         run: |
-          SHA="$(git rev-parse HEAD)"
-          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
-          if [ "${{ github.event_name }}" = "push" ]; then
-            TAG="${GITHUB_REF_NAME}"
-            python3 - "$TAG" <<'EOF'
-            import re, sys, tomllib
-            tag = sys.argv[1]
-            m = re.fullmatch(r"v(\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?)", tag)
-            if not m:
-                sys.exit(f"tag {tag} is not supported SemVer (want v<major>.<minor>.<patch>[-pre])")
-            with open("Cargo.toml", "rb") as f:
-                version = tomllib.load(f)["package"]["version"]
-            if m.group(1) != version:
-                sys.exit(f"tag {tag} does not match Cargo.toml version {version}")
-            print(f"version={version}")
-            print(f"prerelease={'true' if '-' in version else 'false'}")
-            EOF
+          go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.7
+          "$(go env GOPATH)/bin/actionlint"
+      - id: meta
+        name: Validate source and version
+        env:
+          EVENT: ${{ github.event_name }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if [ "$EVENT" = push ]; then
+            git merge-base --is-ancestor HEAD origin/main
+            python3 scripts/release.py metadata --tag "$TAG" >> "$GITHUB_OUTPUT"
           else
-            VERSION="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["package"]["version"])')"
-            echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+            python3 scripts/release.py metadata >> "$GITHUB_OUTPUT"
           fi
-          echo "tag SHA: $SHA"
 
   build:
-    needs: [validate]
+    needs: validate
     strategy:
-      fail-fast: true
+      fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
           - target: aarch64-unknown-linux-gnu
-            # Requires an ARM64 Linux runner on this account. Public
-            # repositories get ubuntu-24.04-arm on current GitHub plans;
-            # if unavailable here, substitute an authorized self-hosted
-            # ARM64 runner — never a paid runner or the production VPS
-            # without explicit approval.
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ github.ref }}
+          ref: ${{ needs.validate.outputs.sha }}
           persist-credentials: false
-      - name: Install Rust 1.91.0
-        run: rustup toolchain install 1.91.0 --profile minimal
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+      - name: Install Rust
+        run: rustup toolchain install 1.91.0 --profile minimal --component rustfmt,clippy
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16
         with:
           shared-key: ${{ runner.os }}-${{ runner.arch }}-1.91.0-release
       - name: Verify native target
-        run: "test \"$(rustc -vV | sed -n 's/host: //p')\" = \"${{ matrix.target }}\""
-      - name: Build
-        run: cargo build --locked --release
-      - name: Package
-        run: >
-          bash scripts/package.sh
-          "${{ needs.validate.outputs.version }}"
-          "${{ matrix.target }}"
-          target/release dist
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          test "$(rustc -vV | sed -n 's/host: //p')" = "$TARGET"
+      - name: Verify tagged source
+        run: bash scripts/check.sh
+      - name: Build server and test client
+        run: cargo build --locked --release --bin relay-warden --example relayed_transfer
+      - name: Package and test the archive
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+          TARGET: ${{ matrix.target }}
+          SOURCE_SHA: ${{ needs.validate.outputs.sha }}
+        run: |
+          bash scripts/package.sh "$VERSION" "$TARGET" target/release dist
+          python3 scripts/release.py inspect "dist/relay-warden-v$VERSION-$TARGET.tar.gz" --version "$VERSION" --target "$TARGET" --sha "$SOURCE_SHA"
+          bash scripts/smoke.sh "dist/relay-warden-v$VERSION-$TARGET.tar.gz" target/release/examples/relayed_transfer
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: package-${{ matrix.target }}
@@ -103,88 +94,32 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  smoke:
-    needs: [validate, build]
-    strategy:
-      fail-fast: true
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-latest
-          - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-24.04-arm
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          ref: ${{ github.ref }}
-          persist-credentials: false
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: package-${{ matrix.target }}
-          path: dist
-      - name: Install Rust 1.91.0
-        run: rustup toolchain install 1.91.0 --profile minimal
-      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16
-        with:
-          shared-key: ${{ runner.os }}-${{ runner.arch }}-1.91.0-release
-      - name: Verify archive contents
-        run: |
-          test -f dist/SHA256SUMS
-          (cd dist && sha256sum -c SHA256SUMS)
-          TARBALL="dist/relay-warden-v${{ needs.validate.outputs.version }}-${{ matrix.target }}.tar.gz"
-          tar -tzf "$TARBALL" | grep -E "relay-warden$|LICENSE-APACHE|THIRD_PARTY_NOTICES|BUILD.txt|warden.example.toml|relay-warden.service"
-      - name: Build example client
-        run: cargo build --locked --release --example relayed_transfer
-      - name: Smoke test
-        run: >
-          bash scripts/smoke.sh
-          "dist/relay-warden-v${{ needs.validate.outputs.version }}-${{ matrix.target }}.tar.gz"
-          target/release/examples/relayed_transfer
-
   publish:
-    needs: [validate, build, smoke]
+    needs: [validate, build]
     if: github.event_name == 'push'
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
+          persist-credentials: false
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          path: dist
-          merge-multiple: true
-      - name: Verify completeness
-        run: |
-          ls dist/*/SHA256SUMS
-          (cd dist && find . -name SHA256SUMS -execdir sha256sum -c {} \;)
-          for T in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
-            test -f "dist/package-$T/relay-warden-v${{ needs.validate.outputs.version }}-$T.tar.gz"
-          done
-          echo "all expected targets present, checksums verified"
-      - name: Stage draft release (single writer)
+          pattern: package-*
+          path: artifacts
+          merge-multiple: false
+      - name: Verify and collect release assets
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+          SOURCE_SHA: ${{ needs.validate.outputs.sha }}
+        run: python3 scripts/release.py collect artifacts dist --version "$VERSION" --sha "$SOURCE_SHA"
+      - name: Stage draft release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          TAG="${GITHUB_REF_NAME}"
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            if [ "$(gh release view "$TAG" --json isDraft -q .isDraft)" != "true" ]; then
-              echo "release $TAG already published; refusing to touch it" >&2
-              exit 1
-            fi
-            echo "resuming unpublished draft $TAG"
-          else
-            FLAGS="--draft --title $TAG --notes 'Staged by the release pipeline; verify assets before publishing.'"
-            if [ "${{ needs.validate.outputs.prerelease }}" = "true" ]; then
-              FLAGS="$FLAGS --prerelease"
-            fi
-            # shellcheck disable=SC2086
-            gh release create "$TAG" $FLAGS
-          fi
-          for T in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
-            gh release upload "$TAG" \
-              "dist/package-$T/relay-warden-v${{ needs.validate.outputs.version }}-$T.tar.gz" \
-              --clobber
-          done
-          echo "draft staged; a maintainer verifies it before publishing"
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.validate.outputs.version }}
+          SOURCE_SHA: ${{ needs.validate.outputs.sha }}
+        run: python3 scripts/release.py publish dist --version "$VERSION" --sha "$SOURCE_SHA"
