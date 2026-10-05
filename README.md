@@ -1,137 +1,129 @@
 # Relay Warden
 
-Relay Warden is a self-hosted Iroh relay with device approval, bandwidth
-limits, and a shared monthly traffic budget. Manage endpoint access through
-a private administration interface, exempt trusted devices from speed
-limits, and keep relay usage within a configured allowance.
+A self-hosted [Iroh](https://iroh.computer) relay that lets you decide who
+can connect and how much traffic they can use.
 
-It works with compatible Iroh applications: apps that cannot reach each
-other directly relay their encrypted traffic through this server until a
-direct connection succeeds. It is not a general-purpose proxy or VPN, and
-it cannot see or shape arbitrary network traffic.
+Approve endpoints in a private web interface, give each one a speed limit,
+and set a shared monthly budget. Your own endpoints can be exempt from
+speed limits, but they still count towards the budget. When the budget is
+exhausted, all relay connections close; administration remains available.
 
-> Status: pre-release. The code, tests, and deployment artifacts are
-> implemented and locally verified (see `docs/ACCEPTANCE.md`), but no
-> public release or hosted verification exists yet. Relay accounting tracks
-> relayed bytes plus a configured overhead allowance — it is **not** exact
-> cloud billing. Direct peer-to-peer traffic never touches this server and
-> is outside the budget.
+Relay Warden is for applications built with Iroh. It is not a VPN or a
+general-purpose proxy. Direct peer-to-peer traffic does not pass through
+the relay and is not counted. The traffic ledger includes an overhead
+allowance, but it is **not a measurement of your cloud provider's bill**.
 
-## Install
+This project is pre-release. Linux x86-64 and ARM64 archives are configured
+in the release workflow, but no published binaries or hosted validation are
+available yet.
 
-No published binaries exist yet; building from source is the only install
-path today. Release archives (`relay-warden-v<version>-<target>.tar.gz`
-plus `SHA256SUMS`) are planned — see `docs/RELEASING.md` for the pipeline.
+## Try it locally
 
-Requires Rust 1.91.0 (pinned by `rust-toolchain.toml`):
+Start with a source checkout of this repository and open a terminal in its
+root directory. You need Rust (the repository pins 1.91.0), Python 3.11+
+and the native C build tools required by the dependencies. Node 22 is only
+needed for development checks.
 
-```bash
-cargo build --locked --release
-./target/release/relay-warden --version
+Build the server and example client:
+
+```sh
+cargo build --locked --bin relay-warden --example relayed_transfer
 ```
 
-## First run
+Create a fresh trial directory. This example uses a 100 MB budget and
+1 MB/s upload/download limits; it does not change an existing installation.
 
-All paths below are yours to choose. This example uses a temporary
-directory so nothing touches an existing setup:
-
-```bash
-mkdir -p /tmp/warden/state
-head -c 32 /dev/urandom | base64 > /tmp/warden/state/admin.token
-chmod 600 /tmp/warden/state/admin.token
-cp deploy/config.production.example.toml /tmp/warden/warden.toml
-# edit db_path and admin_token_file in warden.toml to point at /tmp/warden/state,
-# and set ordinary speed limits plus the monthly budget (see docs/CONFIGURATION.md)
-./target/release/relay-warden --config /tmp/warden/warden.toml
+```sh
+WARDEN_BIN="$PWD/target/debug/relay-warden"
+WARDEN_DIR="$(mktemp -d)"
+mkdir -m 700 "$WARDEN_DIR/state"
+(umask 077; head -c 32 /dev/urandom | base64 > "$WARDEN_DIR/state/admin.token")
+cp deploy/config.local.example.toml "$WARDEN_DIR/warden.toml"
+printf 'Trial directory: %s\n' "$WARDEN_DIR"
+(cd "$WARDEN_DIR" && "$WARDEN_BIN" --config warden.toml)
 ```
 
-The relay listens on `127.0.0.1:8080` and the admin interface on
-`127.0.0.1:8081`, both loopback-only. From another machine, reach the admin
-interface through an SSH tunnel — never expose it directly:
+Leave that terminal running. Open
+[http://127.0.0.1:8081/admin/](http://127.0.0.1:8081/admin/) and log in
+with the token from the trial directory's `state/admin.token` file.
+Treat the token like a password; anyone with it can administer the relay.
 
-```bash
-ssh -L 8081:127.0.0.1:8081 you@your-server
-# then open http://127.0.0.1:8081/admin/ locally
+### Approve two endpoints and send a message
+
+In a second terminal, from the repository root:
+
+```sh
+./target/debug/examples/relayed_transfer --relay http://127.0.0.1:8080
 ```
 
-## Approve the first endpoint
+The example prints two endpoint IDs and waits. In the admin interface,
+add each ID, enable its **approved** checkbox and save. Return to the
+terminal and press Enter. You should see two received messages followed
+by `relayed transfer OK`.
 
-Every Iroh app instance has an **endpoint ID**: the public key of that app
-instance. It identifies the installation, not the hardware — reinstalling or
-resetting keys creates a new ID. Public IDs are safe to submit for approval;
-private keys are never needed and must never be shared.
+An endpoint ID is an application's public key, not a hardware identifier.
+Applications must retain their private key to keep the same identity;
+resetting it requires a new approval. Never submit a private key to the
+relay administrator. This example intentionally creates disposable keys
+each time it runs.
 
-An Iroh application prints or logs its endpoint ID on startup (see
-[Connect an application](#connect-an-application)). Approve it in the admin
-UI (`Add endpoint`, then tick approved and Save), or with the API:
+Stop the server with Ctrl-C when finished. Keep the trial directory if
+you want to retain its policies and usage; otherwise it is just test state.
 
-```bash
-TOKEN="$(cat /tmp/warden/state/admin.token)"
-curl -X PUT http://127.0.0.1:8081/admin/endpoints/<ENDPOINT_ID> \
-  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
-  -d '{"label": "my laptop", "approved": true}'
+## Use it on a server
+
+For a long-running installation, build with `cargo build --locked --release`
+and follow the [installation guide](docs/INSTALL.md). It covers the service
+account, state directory and systemd unit. Future release archives will
+include the executable, the same guide, configuration examples, licence
+texts and checksums.
+
+Serve the public relay over HTTPS using the included
+[Caddy](deploy/caddy.example) or [Nginx](deploy/nginx.example) example.
+Keep the admin listener private. To administer a remote server:
+
+```sh
+ssh -N -L 8081:127.0.0.1:8081 you@your-server
 ```
 
-The full API (revisions, revocation, settings, audit, usage, metrics) is
-documented in `docs/API.md`; the UI covers the same actions.
+Then open the same local admin URL. Stop your local trial first if it is
+already using port 8081.
 
-## Connect an application
+Your application must be configured to use your relay URL, for example
+`https://relay.example.com`. This is an application-side setting:
+Relay Warden cannot redirect existing apps automatically. The included
+[transfer example](examples/relayed_transfer.rs) tests the relay protocol;
+it is not a complete Iroh application or an SDK integration guide.
 
-Point a compatible Iroh application at your relay URL instead of (or in
-addition to) the default relays. With `iroh` this is a `RelayMap` holding
-a `RelayConfig` for `https://relay.example.com`; see the tested example:
+## Configure access and traffic
 
-```bash
-cargo run --example relayed_transfer -- --relay https://relay.example.com \
-  --admin http://127.0.0.1:8081 --admin-token "$(cat admin.token)"
-```
+Each endpoint can use the default speed, a custom speed, or no speed cap.
+Rates are **bytes per second**, not bits per second: `100_000` is about
+100 KB/s or 0.8 Mbit/s. Upload and download limits are separate, and
+multiple connections from the same endpoint share the same limits.
 
-which generates two identities, approves them, and relays one message each
-way, printing `relayed transfer OK`. Without approval the relay denies the
-connection (`tests/relay.rs` pins this behaviour).
+The monthly budget is shared across all approved endpoints, including
+unlimited ones. It resets by UTC calendar month. The relay stops at
+`budget − headroom`; for example, 6 TB means 6,000,000,000,000 bytes,
+not 6 TiB. Other services on the same server need separate traffic
+monitoring.
 
-## Limits and budget
+Configuration values seed a new database. Later admin changes persist:
+editing the TOML file does not overwrite those saved settings.
 
-Each approved endpoint has a speed policy:
+- [Configuration](docs/CONFIGURATION.md): settings, units and persistence.
+- [Operations](docs/OPERATIONS.md): HTTPS, monitoring, backups and upgrades.
+- [Admin API](docs/API.md): authentication and scripted management.
+- [Architecture](docs/ARCHITECTURE.md): relay integration and accounting.
+- [Contributing](CONTRIBUTING.md): local checks and development.
+- [Security policy](SECURITY.md): vulnerability reporting and supported versions.
+- [Code of conduct](CODE_OF_CONDUCT.md): community expectations and reporting.
+- [Releasing](docs/RELEASING.md): native builds, archives and draft releases.
 
-- `default`: the operator's `default_rx_bps` / `default_tx_bps`.
-- `custom`: per-endpoint `custom_rx_bps` / `custom_tx_bps` overrides.
-- `unlimited`: no speed cap (typically the operator's own devices).
+## Licence
 
-`rx` caps upload *to* the relay, `tx` caps download *from* it; both are in
-**bytes per second** (e.g. `100_000` ≈ 100 KB/s ≈ 0.8 Mbit/s). All
-connections of one endpoint share its allowance.
-
-Unlimited endpoints still draw from the shared monthly budget, and budget
-exhaustion disconnects **everyone**, including unlimited endpoints. The
-budget counts relayed bytes plus a configured overhead percentage, and
-enforcement stops early at `budget − headroom`. The example 6 TB budget in
-`deploy/config.production.example.toml` means 6,000,000,000,000 bytes
-(decimal TB, not 6 TiB ≈ 6,597,069,766,656 bytes).
-
-## HTTPS and running the service
-
-Terminate TLS at a reverse proxy and forward only `/relay*` to the
-loopback backend, preserving WebSocket upgrades, the subprotocol header,
-and the client-auth header. Worked snippets live in
-`deploy/caddy.example` and `deploy/nginx.example`. Keep `/admin` and
-`/metrics` off the public routing. Run under systemd with
-`deploy/relay-warden.service`; backup, upgrade, monitoring and recovery
-are covered in `docs/OPERATIONS.md`.
-
-## Build, contribute, licence
-
-```bash
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test
-bash scripts/check-ui.sh
-```
-
-See `CONTRIBUTING.md` for the workflow and `docs/ARCHITECTURE.md` for how
-the pieces fit. Original code is Apache-2.0 © Sudosy Labs contributors
-(`LICENSE-APACHE`); linked and adapted third-party code keeps its own
-notices — see `THIRD_PARTY_NOTICES.md` and `licenses/upstream/`.
-
-Further reading: `docs/CONFIGURATION.md` (every setting, units, what
-persists), `docs/API.md`, `docs/OPERATIONS.md`, `docs/RELEASING.md`.
+Original Relay Warden code is [Apache-2.0](LICENSE-APACHE).
+Dependencies and adapted upstream code retain their own licences and
+notices; see [third-party notices](THIRD_PARTY_NOTICES.md). Release archives
+also include dependency licence texts and documented
+[attribution exceptions](licenses/README.md).
