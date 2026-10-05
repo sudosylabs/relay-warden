@@ -1,7 +1,8 @@
 # relay-warden operations guide
 
-Prepare-only artifacts. Nothing here touches a live host; every step below
-requires the operator's explicit deployment authorization.
+Runbook for installing, serving, and recovering a relay. Stopping,
+replacing, or reconfiguring a live service is always disruptive — plan a
+maintenance window; the rollback section below is part of that plan.
 
 ## Layout (operator-chosen paths)
 
@@ -11,6 +12,11 @@ requires the operator's explicit deployment authorization.
 - Service: `deploy/relay-warden.service` (example unit)
 
 ## Fresh install
+
+Supported host: 64-bit Linux (x86-64 or ARM64) with glibc 2.39 or newer
+(Ubuntu 24.04 or equivalent). The release binaries are dynamically linked
+against the build runner's glibc — they do not run on musl-based or older
+systems; check `ldd --version` before installing elsewhere.
 
 1. Create the user and directories:
    `useradd -r -s /usr/sbin/nologin relay-warden`
@@ -35,6 +41,9 @@ for existing services. Preserve WebSocket upgrades and the
 `Sec-WebSocket-Protocol` subprotocol (`iroh-relay-v1/v2`) plus the
 `X-Iroh-Relay-Client-Auth-V1` header. Do not buffer relay WebSockets.
 Examples: `deploy/caddy.example`, `deploy/nginx.example`.
+Never route `/admin` or `/metrics` through the public edge: the admin
+listener stays loopback-only (SSH tunnel for remote access) precisely so a
+proxy misconfiguration cannot expose administration.
 UDP discovery stays off unless separately decided and implemented.
 
 ## Admin access
@@ -85,7 +94,7 @@ guarantee. Roll back the **binary only** and keep the current database:
    charged_bytes = max(charged_bytes, (SELECT charged_bytes FROM
    b.quota_periods WHERE period = quota_periods.period)), exhausted =
    exhausted OR (SELECT exhausted FROM b.quota_periods WHERE period =
-   quota_periods.period));"`
+   quota_periods.period);"`
    then re-verify `charged_bytes`/`exhausted` before opening traffic.
    Never fall back to an unrestricted relay binary: a failed custom server
    stays down, loud, rather than silently open.

@@ -42,7 +42,7 @@ deployment-dependent check. Deployment itself is a separate authorized phase.
 | Crash/restart preserves ledger | `tests/quota.rs::quota_crash_preserves_ledger` (exact equality + continuation) |
 | Forward-only months, backward-clock isolation | `tests/quota.rs::quota_month_rollover_and_backward_clock` |
 | Budget-cut exhaustion, edit isolation, audited reopen | `tests/quota.rs::quota_budget_cut_exhausts_but_edits_do_not_reset` |
-| No exact cloud-billing claim | `DESIGN.md` units section; `usage.uncertainty_note` |
+| No exact cloud-billing claim | `ARCHITECTURE.md` units section; `usage.uncertainty_note` |
 
 ## Gate E — operations and delivery
 
@@ -94,3 +94,22 @@ deployment-dependent check. Deployment itself is a separate authorized phase.
 - Whether protocol V1 clients must be supported in the field.
 - Future aggregate shaper (would also constrain owners; currently none).
 - VPS re-inspection at deploy time (addresses, listeners, firewall, free-tier terms, DNS).
+
+## Verification status (docs-release track, 2026-10-05)
+
+- Implemented: operator-first README + `CONFIGURATION`/`API`/`ARCHITECTURE`/
+  `OPERATIONS`/`CONTRIBUTING`/`RELEASING` docs; Apache-2.0 licence +
+  `LICENSE-APACHE`; `THIRD_PARTY_NOTICES.md` generated from `Cargo.lock`
+  (382 crates, all permissive, reviewed) with vendored upstream texts;
+  hardened CI (pins, concurrency, least privilege, timeouts, cache, locked
+  builds); release workflow (validate/build/smoke/publish separation,
+  dry-run default); `scripts/package.sh` + `scripts/smoke.sh` +
+  `scripts/check-ui.sh` + `scripts/gen-notices.sh`; tested client example.
+- Locally verified: `cargo fmt --check`, `cargo clippy --locked
+  --all-targets -- -D warnings`, `cargo test --locked` (62 green),
+  `scripts/check-ui.sh` + node syntax, YAML parses, doc-link check,
+  packaging drill + checksum verification, smoke test incl. a real approved
+  relayed transfer, README first-run flow against a temp state dir.
+- Hosted-only (explicitly unverified): GitHub workflow runs, ARM64/x86-64
+  release artifacts, draft publication, `ubuntu-24.04-arm` runner
+  availability. No tag, release, remote, or deployment was created.

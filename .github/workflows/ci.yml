@@ -1,19 +1,55 @@
+# Pinned third-party Actions with verified commit SHAs.
+# Resolved 2026-10-05 via the GitHub commits API (each SHA is the tip of the
+# named major-version branch on that date, PGP-verified by GitHub).
+# Re-check before upgrading: compare the branch tip, review the diff, and
+# update the comment alongside the SHA. Never invent a SHA.
+#
+# actions/checkout@v4            11d5960a326750d5838078e36cf38b85af677262
+# actions/setup-node@v4          49933ea5288caeca8642d1e84afbd3f7d6820020
+# Swatinem/rust-cache            f0d9c3887740aee45f6153b24b3a6b815192ec16 (default branch)
+# actions/upload-artifact@v4     ea165f8d65b6e75b540449e92b4886f43607fa02
+# actions/download-artifact@v4   d3f86a106a0bac45b974a628896c90dbdf5c8093
+#
+# The Rust toolchain comes from rust-toolchain.toml via a rustup run step,
+# not a third-party action (actions-rust-lang/rustup has no stable major
+# tag to pin against).
 name: ci
-on: [push, pull_request]
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    # Tags are owned by the release workflow, not ordinary CI.
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
 jobs:
+  # Single required check for branch protection: `verify`.
   verify:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions-rust-lang/rustup@v1
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          toolchain: 1.91.0
-          components: rustfmt, clippy
-      - uses: actions/setup-node@v4
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
-      - name: admin UI syntax
-        run: python3 -c "import re; s=open('src/admin.rs').read(); open('/tmp/admin_ui.js','w').write(re.search(r'<script>\n(.*)\n</script>', s, re.DOTALL).group(1))" && node --check /tmp/admin_ui.js
-      - run: cargo fmt --check
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test
+      - name: Install Rust 1.91.0
+        run: rustup toolchain install 1.91.0 --profile minimal --component rustfmt,clippy
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16
+        with:
+          shared-key: ${{ runner.os }}-1.91.0
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Tests
+        run: cargo test --locked
+      - name: Admin UI syntax
+        run: bash scripts/check-ui.sh

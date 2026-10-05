@@ -7,8 +7,9 @@ use relay_warden::{
 };
 use tracing_subscriber::EnvFilter;
 
-/// relay-warden: private Iroh relay (Gate D: monthly budget enforcement).
+/// relay-warden: self-hosted Iroh relay with approval, limits, and budget.
 #[derive(Debug, Parser)]
+#[command(name = "relay-warden", version)]
 struct Args {
     /// Relay listen address, e.g. 127.0.0.1:8080. Overrides config file.
     #[arg(long)]

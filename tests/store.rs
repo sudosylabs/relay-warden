@@ -125,6 +125,43 @@ async fn store_rejected_patch_commits_nothing() {
 }
 
 #[tokio::test]
+async fn store_rollback_reconciliation_preserves_spent_quota() {
+    // Mirrors the documented rollback reconciliation in OPERATIONS.md: carry
+    // each period's charged bytes and exhaustion forward by maximum, so a
+    // restored backup can never resurrect spent allowance.
+    let (live, live_dir) = open_named("live").await;
+    let (backup, backup_dir) = open_named("backup").await;
+    live.open_period("2026-03").await.unwrap();
+    live.add_charged("2026-03", 90_000).await.unwrap();
+    live.set_exhausted("2026-03", true).await;
+    backup.open_period("2026-03").await.unwrap();
+    backup.add_charged("2026-03", 10_000).await.unwrap();
+    drop(live);
+    drop(backup);
+    // The documented procedure, executed as SQL (tested here, not just docs).
+    let live_path = live_dir.0.join("w.db");
+    let backup_path = backup_dir.0.join("w.db");
+    let merged = tokio::task::spawn_blocking(move || {
+        let conn = rusqlite::Connection::open(&live_path).unwrap();
+        conn.execute("ATTACH ? AS b", [backup_path.to_str().unwrap()]).unwrap();
+        conn.execute(
+            "UPDATE quota_periods SET charged_bytes = max(charged_bytes, (SELECT charged_bytes FROM b.quota_periods WHERE period = quota_periods.period)), exhausted = exhausted OR (SELECT exhausted FROM b.quota_periods WHERE period = quota_periods.period)",
+            [],
+        )
+        .unwrap();
+        conn.query_row(
+            "SELECT charged_bytes, exhausted FROM quota_periods WHERE period='2026-03'",
+            [],
+            |r| Ok((r.get::<_, i64>(0).unwrap(), r.get::<_, i32>(1).unwrap())),
+        )
+        .unwrap()
+    })
+    .await
+    .unwrap();
+    assert_eq!(merged, (90_000, 1));
+}
+
+#[tokio::test]
 async fn store_audit_appends() {
     let (store, _guard) = open_named("audit").await;
     store.append_audit("admin", "login", "", "").await;

@@ -1,7 +1,59 @@
-# relay-warden design note
+# relay-warden architecture
 
-Companion to the implementation handoff. Units, directions, lifecycle, and
-failure behavior in one place so operators do not have to infer them.
+How the upstream library integrates with policy, shaping, and accounting.
+For operations see `OPERATIONS.md`; for settings reference see
+`CONFIGURATION.md`.
+
+## Upstream integration
+
+One custom executable owns policy, accounting, administration, and the
+relay integration around the public `iroh-relay` library API (no upstream
+patches, no private APIs). The public HTTPS proxy stays shared
+infrastructure; the relay itself binds loopback behind it.
+
+```text
+Approved Iroh clients
+       |
+       | HTTPS /relay
+       v
+Shared HTTPS edge ---- other hostnames ---> future services
+       |
+       v
+Custom relay on loopback
+  HTTP/WebSocket negotiation and bounded handshake
+       |
+  Upstream authentication and our admission policy
+       |
+  Endpoint-aware traffic adapter + shared quota gate
+       |
+  Upstream RelayedStream / Clients registry / routing
+       |
+  SQLite policy + accounting store
+       ^
+       |
+Private admin API/UI + metrics + quota supervisor
+```
+
+Request path per connection: negotiate the WebSocket subprotocol (V2
+preferred, V1 accepted, anything else rejected), wrap the socket in our
+byte-stream adapter, run upstream `handshake::serverside`, authorize
+against the current approval policy, attach the shared per-endpoint
+limiter, register with the single shared `Clients` registry. Handshake
+traffic flows unshaped; shaping and budget gating engage after
+authorization. Behind a TLS-terminating edge there is no exporter keying
+material, so authentication uses the signed-challenge fallback, exactly as
+upstream's own embedding example does.
+
+Module map: `relay` (protocol/adapter), `policy` (records, admission,
+revocation), `limiter` (directional buckets), `quota` (monthly ledger),
+`store` (SQLite on a worker thread), `admin` (private API/UI), `service`
+(multi-step update coordinator), `config`, `observability` via
+`/admin/status` + `/admin/metrics`.
+
+## Design note
+
+Units, directions, lifecycle, and failure behavior in one place so
+operators do not have to infer them.
 
 ## Identity lifecycle
 

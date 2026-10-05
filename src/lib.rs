@@ -3,7 +3,7 @@
 //! Axum frontend embedding public `iroh-relay` APIs, with SQLite-backed
 //! endpoint policy and live revocation, a private admin API, shared
 //! per-endpoint throughput enforcement, and a durable monthly outbound
-//! budget. See `docs/DESIGN.md` for the architecture and `docs/ACCEPTANCE.md`
+//! budget. See `docs/ARCHITECTURE.md` for the architecture and `docs/ACCEPTANCE.md`
 //! for the requirement mapping.
 
 pub mod access;
