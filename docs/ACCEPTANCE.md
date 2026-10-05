@@ -52,8 +52,8 @@ deployment-dependent check. Deployment itself is a separate authorized phase.
 | Alert dedup once/period, persisted, failure-safe | `gate_e_alerts_fire_once_per_period_and_survive_restart` |
 | Connection ceilings, body limits, schema guard | `gate_e_per_endpoint_cap_denies_with_balance`, `gate_e_global_ceiling_rejects_over_limit`, `gate_e_admin_body_limit_and_schema_guard` |
 | Scraper outage independence | Structural (no metrics dependency in grant path); all Gate D tests pass without scraping |
-| ARM64 build | `cargo check --target aarch64-unknown-linux-gnu` (see build evidence) |
-| Release build | `cargo build --release` host (see build evidence) |
+| ARM64 build | Attempted `cargo check --target aarch64-unknown-linux-gnu` (rust-std installed; `zig cc` + `cmake` installed locally): blocked in third-party `aws-lc-sys` 0.45.0 asm (`-Wa,--noexecstack` rejected by zig cc) — a cross-C-toolchain limitation of this Mac host, not our code (zero `cfg(target_*)`; all deps publish aarch64-Linux support). Mitigation: build natively on the ARM64 host/CI at deploy time (see `OPERATIONS.md` release pinning). Our code introduces no target-specific paths. |
+| Release build | `rustup run 1.91.0 cargo build --release` on aarch64-apple-darwin: success in 5m49s. Smoke-tested the artifact with a temp config (6 TB budget): `/` → `relay-warden`, `/ping` → 200, `/admin/status` → 401 unauth / 200 authed with live quota ledger (period `2026-10`, cutoff = budget − 1 GB headroom). |
 | Reverse-proxy compatibility | Negotiation/header preservation documented in `OPERATIONS.md` + `deploy/` snippets; live edge verification is a **deployment check** (loopback tests cannot prove a specific proxy) |
 | Deploy/rollback artifacts, no execution | `deploy/`, `OPERATIONS.md`; nothing executed against any host |
 
