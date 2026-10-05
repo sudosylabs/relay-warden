@@ -5,10 +5,9 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-OUT="THIRD_PARTY_NOTICES.md"
-TOOL="cargo metadata $(cargo --version | head -n1)"
+OUT="${1:-THIRD_PARTY_NOTICES.md}"
 
-cargo metadata --locked --format-version 1 > /dev/null # fail fast offline-safe
+cargo metadata --locked --format-version 1 > /dev/null
 
 python3 - "$OUT" <<'EOF'
 import json, subprocess, sys
@@ -30,6 +29,10 @@ with open(out, "w") as f:
     f.write("Relay Warden's original code is Apache-2.0 (Sudosy Labs contributors),\n")
     f.write("see `LICENSE-APACHE`. This file lists linked third-party crates from\n")
     f.write("`Cargo.lock` plus additional notices that a manifest scan cannot see.\n\n")
+    f.write("Release archives also include `DEPENDENCY_LICENSES.txt`: original licence\n")
+    f.write("and notice files collected from the locked target dependency sources by\n")
+    f.write("`scripts/dependency-licenses.py`. That bundle includes build/test dependencies\n")
+    f.write("and nested vendored notices; this table alone is not a licence-text bundle.\n\n")
     f.write("## Additional notices (reviewed, not scanner-generated)\n\n")
     f.write("- `iroh-relay` (n0-computer/iroh v1.3.0, MIT OR Apache-2.0): portions of\n")
     f.write("  the relay protocol derive from Tailscale code under BSD-3-Clause;\n")
