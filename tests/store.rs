@@ -125,40 +125,43 @@ async fn store_rejected_patch_commits_nothing() {
 }
 
 #[tokio::test]
-async fn store_rollback_reconciliation_preserves_spent_quota() {
-    // Mirrors the documented rollback reconciliation in OPERATIONS.md: carry
-    // each period's charged bytes and exhaustion forward by maximum, so a
-    // restored backup can never resurrect spent allowance.
-    let (live, live_dir) = open_named("live").await;
-    let (backup, backup_dir) = open_named("backup").await;
+async fn store_binary_restart_preserves_all_ledger_periods() {
+    // Binary-only recovery keeps the current DB, not a stale backup. Verify
+    // complete rows across month boundaries, including exhaustion/warnings.
+    let (live, live_dir) = open_named("restart").await;
     live.open_period("2026-03").await.unwrap();
     live.add_charged("2026-03", 90_000).await.unwrap();
     live.set_exhausted("2026-03", true).await;
-    backup.open_period("2026-03").await.unwrap();
-    backup.add_charged("2026-03", 10_000).await.unwrap();
+    live.set_warn("2026-03", 90).await;
+    live.open_period("2026-04").await.unwrap();
+    live.add_charged("2026-04", 15_000).await.unwrap();
+    live.set_warn("2026-04", 75).await;
     drop(live);
-    drop(backup);
-    // The documented procedure, executed as SQL (tested here, not just docs).
-    let live_path = live_dir.0.join("w.db");
-    let backup_path = backup_dir.0.join("w.db");
-    let merged = tokio::task::spawn_blocking(move || {
-        let conn = rusqlite::Connection::open(&live_path).unwrap();
-        conn.execute("ATTACH ? AS b", [backup_path.to_str().unwrap()]).unwrap();
-        conn.execute(
-            "UPDATE quota_periods SET charged_bytes = max(charged_bytes, (SELECT charged_bytes FROM b.quota_periods WHERE period = quota_periods.period)), exhausted = exhausted OR (SELECT exhausted FROM b.quota_periods WHERE period = quota_periods.period)",
-            [],
-        )
-        .unwrap();
-        conn.query_row(
-            "SELECT charged_bytes, exhausted FROM quota_periods WHERE period='2026-03'",
-            [],
-            |r| Ok((r.get::<_, i64>(0).unwrap(), r.get::<_, i32>(1).unwrap())),
-        )
-        .unwrap()
-    })
-    .await
-    .unwrap();
-    assert_eq!(merged, (90_000, 1));
+    let reopened = Store::open(&live_dir.0.join("w.db")).await.unwrap();
+    let march = reopened.read_period("2026-03").await.unwrap();
+    let april = reopened.read_period("2026-04").await.unwrap();
+    assert_eq!(
+        (
+            march.charged_bytes,
+            march.exhausted,
+            march.warn75,
+            march.warn90
+        ),
+        (90_000, true, false, true)
+    );
+    assert_eq!(
+        (
+            april.charged_bytes,
+            april.exhausted,
+            april.warn75,
+            april.warn90
+        ),
+        (15_000, false, true, false)
+    );
+    assert_eq!(
+        reopened.latest_period().await.unwrap().as_deref(),
+        Some("2026-04")
+    );
 }
 
 #[tokio::test]

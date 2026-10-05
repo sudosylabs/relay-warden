@@ -19,6 +19,21 @@ fn config_defaults_validate() {
 }
 
 #[test]
+fn shipped_configurations_parse_and_keep_production_guards() {
+    for text in [
+        include_str!("../deploy/config.local.example.toml"),
+        include_str!("../deploy/config.production.example.toml"),
+    ] {
+        let config: Config = toml::from_str(text).unwrap();
+        config.validate().unwrap();
+        assert!(config.require_default_limits && config.require_quota_budget);
+        assert!(config.listen.ip().is_loopback() && config.admin_listen.ip().is_loopback());
+        assert!(config.default_rx_bps.unwrap() > 0 && config.default_tx_bps.unwrap() > 0);
+        assert!(config.quota_budget_bytes.unwrap() > config.quota_headroom_bytes.unwrap());
+    }
+}
+
+#[test]
 fn config_rejects_empty_hot_paths() {
     let mut c = valid();
     c.max_handshake_concurrency = 0;
