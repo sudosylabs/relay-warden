@@ -1,0 +1,8 @@
+# Caddy example: shared edge, relay on loopback. Adapt names/ports.
+# Only /relay* goes to the warden; everything else keeps existing routes.
+
+relay1.example.com {
+	reverse_proxy /relay* 127.0.0.1:8080
+	# Do not buffer relay WebSockets; preserve upgrade + subprotocol headers
+	# (Caddy passes Sec-WebSocket-Protocol through by default).
+}

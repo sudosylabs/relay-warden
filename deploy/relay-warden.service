@@ -1,0 +1,28 @@
+[Unit]
+Description=relay-warden private Iroh relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=relay-warden
+Group=relay-warden
+ExecStart=/opt/relay-warden/relay-warden --config /etc/relay-warden/warden.toml
+Restart=on-failure
+RestartSec=5
+# Bounded logs and resource ceilings (tune to the host).
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/relay-warden
+# Writable state (SQLite) lives under /var/lib/relay-warden only.
+Environment=RUST_LOG=info
+# Watchdog intentionally omitted: automatic restarts must preserve the
+# fail-closed quota ledger, and a stuck relay must not be masked as healthy.
+# Liveness = relay transfer check + GET /admin/status via SSH tunnel.
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,30 @@
+# relay-warden example config (generic, self-hostable).
+# Copy and adjust for your host. No VPS-specific values here.
+listen = "127.0.0.1:8080"
+max_handshake_concurrency = 64
+handshake_timeout_secs = 10
+key_cache_capacity = 1024
+
+# SQLite policy/accounting database.
+db_path = "warden.db"
+
+# Ordinary-endpoint default throughput (bytes/sec, both directions).
+# Required in production unless require_default_limits = false (tests/dev).
+default_rx_bps = 100_000
+default_tx_bps = 100_000
+require_default_limits = true
+
+# Shared monthly outbound budget (bytes). Required in production unless
+# require_quota_budget = false (tests/dev). Enforcement is on *charged* bytes
+# (payload + overhead allowance), with an earlier effective cutoff at
+# budget - headroom. Charged bytes are relay accounting, not cloud billing.
+quota_budget_bytes = 6_000_000_000_000
+quota_headroom_bytes = 1_000_000_000
+quota_overhead_pct = 10
+quota_chunk_bytes = 32768
+require_quota_budget = true
+
+# Private admin listener (loopback; use an SSH tunnel for remote access).
+admin_listen = "127.0.0.1:8081"
+# File containing the high-entropy admin token (chmod 0600). No default.
+admin_token_file = "admin.token"

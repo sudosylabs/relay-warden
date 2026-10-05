@@ -1,0 +1,32 @@
+# relay-warden production config example. Copy to /etc/relay-warden/warden.toml
+# and adjust. All values are operator-chosen; nothing here assumes a host.
+listen = "127.0.0.1:8080"
+max_handshake_concurrency = 64
+handshake_timeout_secs = 10
+key_cache_capacity = 1024
+
+db_path = "/var/lib/relay-warden/warden.db"
+admin_listen = "127.0.0.1:8081"
+admin_token_file = "/var/lib/relay-warden/admin.token"
+
+# Ordinary endpoints: explicit caps required (no silent throughput choice).
+# CONFIRM these numbers with the operator before deployment.
+default_rx_bps = 100_000
+default_tx_bps = 100_000
+require_default_limits = true
+
+# Shared monthly budget. 6_000_000_000_000 = 6 TB decimal (explicit unit).
+# Charged bytes = payload + overhead allowance; cutoff = budget - headroom.
+# CONFIRM budget, headroom, and overhead with the operator before deployment.
+quota_budget_bytes = 6_000_000_000_000
+quota_headroom_bytes = 1_000_000_000
+quota_overhead_pct = 10
+quota_chunk_bytes = 32768
+require_quota_budget = true
+
+# Connection ceilings (DoS bounds, not throughput).
+max_connections = 1024
+max_connections_per_endpoint = 16
+
+# Alert webhook (unset = disabled; flags still persist). CONFIRM destination.
+# alert_webhook_url = "https://hooks.example.com/warden"
