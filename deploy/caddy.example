@@ -1,8 +1,10 @@
 # Caddy example: shared edge, relay on loopback. Adapt names/ports.
-# Only /relay* goes to the warden; everything else keeps existing routes.
+# DNS must point here and TCP 80/443 must reach Caddy for automatic HTTPS.
+# The relay transport and latency probe are public; administration is not.
 
-relay1.example.com {
-	reverse_proxy /relay* 127.0.0.1:8080
+relay.example.com {
+	@iroh path /relay /ping
+	reverse_proxy @iroh 127.0.0.1:8080
 	# Do not buffer relay WebSockets; preserve upgrade + subprotocol headers
 	# (Caddy passes Sec-WebSocket-Protocol through by default).
 }

@@ -1,0 +1,12 @@
+# Local trial: paths are relative to the directory where you start the server.
+listen = "127.0.0.1:8080"
+admin_listen = "127.0.0.1:8081"
+db_path = "state/warden.db"
+admin_token_file = "state/admin.token"
+default_rx_bps = 1_000_000
+default_tx_bps = 1_000_000
+require_default_limits = true
+quota_budget_bytes = 100_000_000
+quota_headroom_bytes = 1_000_000
+quota_overhead_pct = 10
+require_quota_budget = true

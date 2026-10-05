@@ -4,11 +4,11 @@
 //! the admin API, then relays one datagram in each direction.
 //!
 //! ```sh
-//! # Manual approval: print the IDs, approve them in the admin UI, then run.
+//! # Manual approval: approve the printed IDs in the UI, then press Enter.
 //! cargo run --example relayed_transfer -- --relay http://127.0.0.1:8080
 //! # Automatic approval for local testing (loopback only):
 //! cargo run --example relayed_transfer -- --relay http://127.0.0.1:8080 \
-//!   --admin http://127.0.0.1:8081 --admin-token "$(cat admin.token)"
+//!   --admin http://127.0.0.1:8081 --admin-token-file admin.token
 //! ```
 
 use std::time::Duration;
@@ -31,9 +31,9 @@ struct Args {
     /// Admin base URL for automatic approval (testing only)
     #[arg(long)]
     admin: Option<String>,
-    /// Admin bearer token (testing only; never commit this value)
-    #[arg(long)]
-    admin_token: Option<String>,
+    /// File containing the admin bearer token (avoids secrets in process args)
+    #[arg(long, requires = "admin")]
+    admin_token_file: Option<std::path::PathBuf>,
 }
 
 #[tokio::main]
@@ -49,12 +49,23 @@ async fn main() -> anyhow::Result<()> {
     let b_id = b_sk.public();
     println!("endpoint A: {a_id}\nendpoint B: {b_id}");
 
-    if let (Some(admin), Some(token)) = (args.admin, args.admin_token) {
+    if let (Some(admin), Some(token_file)) = (args.admin, args.admin_token_file) {
+        let admin_url: reqwest::Url = admin.parse()?;
+        let loopback = admin_url.host_str().is_some_and(|h| {
+            h == "localhost"
+                || h.parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback())
+        });
+        anyhow::ensure!(
+            loopback && admin_url.scheme() == "http",
+            "automatic approval requires a loopback HTTP admin URL (use an SSH tunnel)"
+        );
+        let token = std::fs::read_to_string(token_file)?;
         let http = reqwest::Client::new();
         for id in [a_id, b_id] {
             let r = http
                 .put(format!("{admin}/admin/endpoints/{id}"))
-                .bearer_auth(&token)
+                .bearer_auth(token.trim())
                 .json(&serde_json::json!({"label": "example", "approved": true}))
                 .send()
                 .await?;
@@ -64,7 +75,12 @@ async fn main() -> anyhow::Result<()> {
         }
         println!("approved via admin API");
     } else {
-        println!("approve both IDs in the admin interface (unapproved IDs are denied)");
+        println!("Approve both IDs in the admin interface, then press Enter to connect.");
+        let mut line = String::new();
+        anyhow::ensure!(
+            std::io::stdin().read_line(&mut line)? > 0,
+            "approval confirmation required"
+        );
     }
 
     let mut a = ClientBuilder::new(relay_url.clone(), a_sk, DnsResolver::new())
@@ -92,6 +108,10 @@ async fn main() -> anyhow::Result<()> {
             .ok_or_else(|| anyhow::anyhow!("relay closed the connection"))??;
         match msg {
             RelayToClientMsg::Datagrams { datagrams, .. } => {
+                anyhow::ensure!(
+                    datagrams.contents.as_ref() == word.as_bytes(),
+                    "relay payload differs from what was sent"
+                );
                 println!("received: {}", String::from_utf8_lossy(&datagrams.contents));
             }
             other => anyhow::bail!("unexpected message: {other:?}"),

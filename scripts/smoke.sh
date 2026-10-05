@@ -2,14 +2,26 @@
 # Smoke-test a packaged release archive against a throwaway local instance.
 # Never deploys anywhere: everything binds loopback in a temp directory.
 #
-# Usage: scripts/smoke.sh <archive.tar.gz> [example-client-dir]
+# Usage: scripts/smoke.sh <archive.tar.gz> <example-client-binary>
 set -euo pipefail
+test "$#" = 2 || { echo "usage: $0 <archive> <example-binary>" >&2; exit 1; }
 ARCH="$1"
 WORK="$(mktemp -d)"
-trap 'kill ${SRV:-0} 2>/dev/null; rm -rf "$WORK"' EXIT
+SRV=""
+cleanup() {
+    if [ -n "$SRV" ]; then
+        kill "$SRV" 2>/dev/null || true
+        wait "$SRV" 2>/dev/null || true
+    fi
+    rm -rf "$WORK"
+}
+trap cleanup EXIT
+python3 "$(dirname "$0")/release.py" inspect "$ARCH"
 tar -C "$WORK" -xzf "$ARCH"
 DIR="$(echo "$WORK"/relay-warden-v*)"
 test -x "$DIR/relay-warden"
+"$DIR/relay-warden" --help >/dev/null
+"$DIR/relay-warden" --version
 
 # Fresh state, production-shaped config. No real budget spent: tiny allowance.
 head -c 32 /dev/urandom | base64 > "$WORK/admin.token"
@@ -37,6 +49,6 @@ echo "metrics: OK"
 
 # Real relayed transfer after approval, via the compiled example client.
 # Second positional arg: path to the `relayed_transfer` example binary.
-test -n "${2:-}" || { echo "usage: $0 <archive> <example-binary>" >&2; exit 1; }
-"$2" --relay "http://127.0.0.1:$PORT_R" --admin "http://127.0.0.1:$PORT_A" --admin-token "$TOKEN" | tail -n 1 | grep -q "relayed transfer OK"
+"$2" --relay "http://127.0.0.1:$PORT_R" --admin "http://127.0.0.1:$PORT_A" --admin-token-file "$WORK/admin.token" | tail -n 1 | grep -q "relayed transfer OK"
+python3 "$(dirname "$0")/manual-approval-smoke.py" "$2" --relay "http://127.0.0.1:$PORT_R" --admin "http://127.0.0.1:$PORT_A" --token-file "$WORK/admin.token"
 echo "smoke: OK"
