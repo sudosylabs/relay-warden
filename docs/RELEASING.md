@@ -34,14 +34,14 @@ Both builds must pass. Only the publisher has `contents: write`.
 CI cancels obsolete runs for the same PR or ref. Releases use a separate
 per-ref concurrency group and do not cancel an active publisher.
 
-The ARM64 job requires an available `ubuntu-24.04-arm` runner. Confirm
-availability before the first hosted run. Do not substitute the production
-server as a build runner.
+The ARM64 job uses the `ubuntu-24.04-arm` runner. Do not substitute the
+production server as a build runner.
 
 ## Package contents and support
 
 Each archive contains the executable, configuration and proxy examples,
-the systemd unit, installation/operations/configuration/API guides,
+the systemd unit, deployment/dashboard/operations/configuration/API guides,
+the deployment diagram and security/community policies,
 project and upstream licences, `DEPENDENCY_LICENSES.txt`, and `BUILD.json`.
 
 Builds use Ubuntu 24.04 and dynamically linked GNU/Linux targets:
@@ -100,5 +100,5 @@ and different-source drafts are refused; tags are never moved. If a draft
 has unexpected assets, resolve that conflict manually before publishing.
 
 Repository environments and branch protection must be configured by a
-maintainer. Require the CI `verify` check. No hosted run, runner support,
-or published release should be claimed until that action actually succeeds.
+maintainer. Require the CI `verify` check and inspect the workflow results
+before publishing.

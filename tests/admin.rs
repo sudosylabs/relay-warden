@@ -354,24 +354,127 @@ async fn admin_page_serves_working_management_ui() {
         .text()
         .await
         .unwrap();
-    // Must parse as JavaScript: extract and check with node at test time is
-    // heavyweight; assert the structural markers of the fixed script instead.
-    assert!(!body.contains("{{"), "doubled braces leak into served JS");
     for marker in [
         "addBtn",
         "loginBtn",
         "logoutBtn", // wiring (no inline onclick)
-        "Revoke",
         "Save settings",
         "Add endpoint",
         "Monthly budget",
-        "encodeURIComponent",
-        "textContent",
-        "X-CSRF-Token",
+        "/admin/admin.js",
+        "/admin/admin.css",
+        "Access requests",
     ] {
         assert!(body.contains(marker), "UI missing control {marker}");
     }
     assert!(!body.contains("innerHTML"), "UI must not use innerHTML");
+    let client = reqwest::Client::new();
+    for (path, content_type, expected) in [
+        (
+            "admin.js",
+            "text/javascript",
+            include_str!("../web/admin.js"),
+        ),
+        ("admin.css", "text/css", include_str!("../web/admin.css")),
+        (
+            "navigation.js",
+            "text/javascript",
+            include_str!("../web/navigation.mjs"),
+        ),
+    ] {
+        let r = client
+            .get(format!("http://{}/admin/{path}", h.admin_addr))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        assert!(r.headers()["content-type"]
+            .to_str()
+            .unwrap()
+            .contains(content_type));
+        assert_eq!(r.headers()["cache-control"], "no-store");
+        assert_eq!(r.text().await.unwrap(), expected);
+    }
+}
+
+#[tokio::test]
+async fn session_can_be_restored_and_logout_invalidates_it() {
+    let h = start(HarnessOptions::default()).await;
+    let base = format!("http://{}/admin", h.admin_addr);
+    let c = reqwest::Client::builder()
+        .cookie_store(true)
+        .build()
+        .unwrap();
+    assert_eq!(
+        c.get(format!("{base}/session"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
+    let r = c
+        .post(format!("{base}/login"))
+        .json(&serde_json::json!({"token":h.token}))
+        .send()
+        .await
+        .unwrap();
+    let login: serde_json::Value = r.json().await.unwrap();
+    let r = c.get(format!("{base}/session")).send().await.unwrap();
+    assert_eq!(r.headers()["cache-control"], "no-store");
+    let session: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(session["csrf"], login["csrf"]);
+    assert_eq!(session["authenticated"], true);
+    assert_eq!(
+        c.post(format!("{base}/logout"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
+    for origin in [
+        "http://localhost.evil.example",
+        "http://127.0.0.1.evil.example",
+        "http://127.0.0.1:1",
+    ] {
+        assert_eq!(
+            c.post(format!("{base}/logout"))
+                .header("X-CSRF-Token", login["csrf"].as_str().unwrap())
+                .header("Origin", origin)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            403
+        );
+    }
+    assert_eq!(
+        c.post(format!("{base}/logout"))
+            .header("X-CSRF-Token", login["csrf"].as_str().unwrap())
+            .header("Origin", format!("http://{}", h.admin_addr))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    assert_eq!(
+        c.get(format!("{base}/session"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
+    assert_eq!(
+        c.get(format!("{base}/endpoints"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
 }
 
 #[tokio::test]
@@ -389,4 +492,151 @@ async fn admin_rejects_oversize_bodies() {
         .await
         .unwrap();
     assert_eq!(r.status(), 413, "oversize admin body must be rejected");
+}
+
+#[tokio::test]
+async fn list_pagination_covers_all_rows_filters_and_clamps() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let h = start(HarnessOptions::default()).await;
+    let client = admin_client(&h.token);
+    let base = format!("http://{}/admin", h.admin_addr);
+    for n in 0..23 {
+        let id = SecretKey::generate().public();
+        approve(
+            &h,
+            &id,
+            serde_json::json!({"label":format!("Device {n:02}")}),
+        )
+        .await;
+        let sk = SecretKey::generate();
+        assert!(ClientBuilder::new(
+            format!("http://{}", h.relay_addr)
+                .parse::<RelayUrl>()
+                .unwrap(),
+            sk,
+            DnsResolver::new()
+        )
+        .tls_client_config(common::tls_config())
+        .connect()
+        .await
+        .is_err());
+    }
+    let store = relay_warden::store::Store::open(&h.db_path).await.unwrap();
+    for n in 0..65 {
+        store
+            .append_audit("test", "pagination", &n.to_string(), "")
+            .await;
+    }
+    for (path, key) in [
+        ("endpoints", "endpoints"),
+        ("pending", "requests"),
+        ("audit", "events"),
+    ] {
+        let legacy: serde_json::Value = client
+            .get(format!("{base}/{path}?limit=200"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let expected = legacy[key].as_array().unwrap();
+        let mut combined = Vec::new();
+        for page in 1..=expected.len().div_ceil(10) {
+            let r = client
+                .get(format!("{base}/{path}?page={page}&limit=10"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status(), 200);
+            let body: serde_json::Value = r.json().await.unwrap();
+            assert_eq!(body["pagination"]["page"], page);
+            assert_eq!(body["pagination"]["total"], expected.len());
+            assert!(body[key].as_array().unwrap().len() <= 10);
+            combined.extend(body[key].as_array().unwrap().iter().cloned());
+        }
+        assert_eq!(
+            &combined, expected,
+            "{path} pagination must cover every row in order"
+        );
+        let clamped: serde_json::Value = client
+            .get(format!("{base}/{path}?page=999999&limit=10"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(clamped["pagination"]["page"], expected.len().div_ceil(10));
+        for invalid in ["page=0", "page=-1", "page=abc", "page=1&limit=0"] {
+            assert_eq!(
+                client
+                    .get(format!("{base}/{path}?{invalid}"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                400,
+                "{path} {invalid}"
+            );
+        }
+    }
+    let filtered: serde_json::Value = client
+        .get(format!("{base}/endpoints?page=2&limit=5&q=Device%200"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(filtered["pagination"]["total"], 10);
+    assert_eq!(filtered["endpoints"].as_array().unwrap().len(), 5);
+    for row in filtered["endpoints"].as_array().unwrap() {
+        assert!(row["label"].as_str().unwrap().starts_with("Device 0"));
+    }
+    let empty: serde_json::Value = client
+        .get(format!("{base}/endpoints?page=9&q=no-such-device"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        empty["pagination"],
+        serde_json::json!({"page":1,"page_size":20,"total":0,"total_pages":1})
+    );
+    assert_eq!(empty["endpoints"], serde_json::json!([]));
+    let pending: serde_json::Value = client
+        .get(format!("{base}/pending?page=3&limit=10"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    for row in pending["requests"].as_array().unwrap() {
+        assert_eq!(
+            client
+                .post(format!(
+                    "{base}/pending/{}/dismiss",
+                    row["endpoint_id"].as_str().unwrap()
+                ))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+    }
+    let after: serde_json::Value = client
+        .get(format!("{base}/pending?page=3&limit=10"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(after["pagination"]["page"], 2);
+    assert_eq!(after["pagination"]["total"], 20);
 }

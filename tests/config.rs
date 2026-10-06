@@ -16,6 +16,55 @@ fn valid() -> Config {
 #[test]
 fn config_defaults_validate() {
     assert!(valid().validate().is_ok());
+    assert!(!valid().require_endpoint_approval);
+    assert!(valid().relay_token_file.is_none());
+}
+
+#[test]
+fn relay_token_config_must_be_separate_and_nonempty() {
+    let mut c = valid();
+    c.relay_token_file = Some(String::new());
+    assert!(c.validate().is_err());
+    c.relay_token_file = Some(c.admin_token_file.clone());
+    assert!(c.validate().is_err());
+    c.relay_token_file = Some("relay.token".into());
+    assert!(c.validate().is_ok());
+    c.require_endpoint_approval = false;
+    assert!(c.validate().is_ok());
+}
+
+#[test]
+fn binary_refuses_missing_short_or_reused_relay_token() {
+    let dir =
+        std::env::temp_dir().join(format!("warden-token-validation-{}", rand::random::<u64>()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let admin = dir.join("admin.token");
+    let relay = dir.join("relay.token");
+    std::fs::write(&admin, "private-admin-token-for-test").unwrap();
+    for content in [None, Some("short"), Some("private-admin-token-for-test")] {
+        if let Some(value) = content {
+            std::fs::write(&relay, value).unwrap();
+        }
+        let cfg = Config {
+            admin_token_file: admin.to_str().unwrap().into(),
+            relay_token_file: Some(relay.to_str().unwrap().into()),
+            db_path: dir.join("warden.db").to_str().unwrap().into(),
+            ..valid()
+        };
+        let path = dir.join("config.toml");
+        std::fs::write(&path, toml::to_string(&cfg).unwrap()).unwrap();
+        let result = std::process::Command::new(env!("CARGO_BIN_EXE_relay-warden"))
+            .args(["--config", path.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(!result.status.success());
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            stderr.contains("relay token") || stderr.contains("must be different"),
+            "{stderr}"
+        );
+        assert!(!stderr.contains("private-admin-token-for-test"));
+    }
 }
 
 #[test]

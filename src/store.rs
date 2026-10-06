@@ -557,6 +557,29 @@ impl Store {
         .await
     }
 
+    /// Read a bounded audit page and its count from one SQLite snapshot.
+    pub async fn audit_page(
+        &self,
+        page: usize,
+        size: usize,
+    ) -> Result<(Vec<serde_json::Value>, usize, usize), String> {
+        let size = size.clamp(1, 200);
+        run(&self.inner, move |conn| {
+            let tx = conn.transaction().map_err(|e| e.to_string())?;
+            let total: usize = tx.query_row("SELECT count(*) FROM audit", [], |r| r.get(0)).map_err(|e|e.to_string())?;
+            let page = page.max(1).min(total.div_ceil(size).max(1));
+            let mut stmt = tx.prepare("SELECT at,actor,action,target,detail FROM audit ORDER BY id DESC LIMIT ? OFFSET ?").map_err(|e|e.to_string())?;
+            let rows = stmt.query_map(rusqlite::params![size as i64, ((page-1)*size) as i64], |r| Ok(serde_json::json!({
+                "at":r.get::<_,String>(0)?, "actor":r.get::<_,String>(1)?, "action":r.get::<_,String>(2)?,
+                "target":r.get::<_,String>(3)?, "detail":r.get::<_,String>(4)?,
+            }))).map_err(|e|e.to_string())?;
+            let events = rows.collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())?;
+            drop(stmt);
+            tx.commit().map_err(|e|e.to_string())?;
+            Ok((events,total,page))
+        }).await
+    }
+
     fn read_settings_locked(
         conn: &rusqlite::Connection,
     ) -> Result<(serde_json::Value, i64), String> {

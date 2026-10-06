@@ -22,7 +22,7 @@
 use std::{
     collections::HashMap,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
     task::Waker,
@@ -62,9 +62,9 @@ pub fn resolve_effective(
     };
     match record {
         None => LimitConfig {
-            rx_bps: None,
-            tx_bps: None,
-            burst_bytes: 65_536,
+            rx_bps: defaults.rx_bps,
+            tx_bps: defaults.tx_bps,
+            burst_bytes: burst_default(defaults.rx_bps, defaults.tx_bps),
         },
         Some(r) => {
             let burst = r.burst_bytes.map(|b| b as u64).unwrap_or_else(|| {
@@ -194,6 +194,7 @@ pub struct EndpointLimiter {
     rx: Mutex<Option<Bucket>>,
     tx: Mutex<Option<Bucket>>,
     config: Mutex<LimitConfig>,
+    network_exempt: AtomicBool,
     revision: Mutex<i64>,
     last_used: Mutex<Instant>,
     waiters: Mutex<HashMap<u64, Waker>>,
@@ -204,11 +205,12 @@ pub struct EndpointLimiter {
 }
 
 impl EndpointLimiter {
-    fn new(cfg: LimitConfig, revision: i64, now: Instant) -> Self {
+    pub(crate) fn new(cfg: LimitConfig, revision: i64, now: Instant) -> Self {
         Self {
             rx: Mutex::new(cfg.rx_bps.map(|r| Bucket::new(r, cfg.burst_bytes, now))),
             tx: Mutex::new(cfg.tx_bps.map(|r| Bucket::new(r, cfg.burst_bytes, now))),
             config: Mutex::new(cfg),
+            network_exempt: AtomicBool::new(false),
             revision: Mutex::new(revision),
             last_used: Mutex::new(now),
             waiters: Mutex::new(HashMap::new()),
@@ -264,6 +266,18 @@ impl EndpointLimiter {
 
     pub fn config(&self) -> LimitConfig {
         *self.config.lock().expect("lock")
+    }
+
+    pub(crate) fn network_exempt(&self) -> bool {
+        self.network_exempt.load(Ordering::Relaxed)
+    }
+    fn set_network_exempt(&self, record: Option<&crate::policy::EndpointPolicy>) {
+        let exempt = record
+            .is_some_and(|r| r.approved && r.speed_policy == crate::policy::SpeedPolicy::Unlimited);
+        let previous = self.network_exempt.swap(exempt, Ordering::Relaxed);
+        if previous != exempt {
+            self.poke();
+        }
     }
 
     /// Register a waiter's waker for policy-change/shutdown wakes.
@@ -357,17 +371,49 @@ impl LimiterMap {
         defaults: &Defaults,
         now: Instant,
     ) -> Arc<EndpointLimiter> {
+        self.try_get_or_create(endpoint_id, record, defaults, now, usize::MAX)
+            .expect("unbounded limiter registry")
+    }
+
+    pub fn try_get_or_create(
+        &self,
+        endpoint_id: &str,
+        record: Option<&crate::policy::EndpointPolicy>,
+        defaults: &Defaults,
+        now: Instant,
+        capacity: usize,
+    ) -> Result<Arc<EndpointLimiter>, &'static str> {
         let cfg = resolve_effective(record, defaults);
         let revision = record.map(|r| r.revision).unwrap_or(0);
         let mut map = self.inner.lock().expect("lock");
         if let Some(lim) = map.get(endpoint_id) {
             lim.apply(cfg, revision, now);
+            lim.set_network_exempt(record);
             lim.touch(now);
-            return lim.clone();
+            return Ok(lim.clone());
+        }
+        if map.len() >= capacity {
+            map.retain(|_, lim| {
+                let cfg = lim.config();
+                let refill = [cfg.rx_bps, cfg.tx_bps]
+                    .into_iter()
+                    .flatten()
+                    .map(|rate| cfg.burst_bytes.div_ceil(rate))
+                    .max()
+                    .unwrap_or(0);
+                Arc::strong_count(lim) > 1
+                    || lim.last_used(now) < Duration::from_secs(600.max(refill))
+                    || lim.check_rx(now).is_some()
+                    || lim.check_tx(now).is_some()
+            });
+            if map.len() >= capacity {
+                return Err("endpoint tracking capacity");
+            }
         }
         let lim = Arc::new(EndpointLimiter::new(cfg, revision, now));
+        lim.set_network_exempt(record);
         map.insert(endpoint_id.to_string(), lim.clone());
-        lim
+        Ok(lim)
     }
 
     /// Push a policy change into the live limiter (no reconnect needed).
@@ -383,6 +429,7 @@ impl LimiterMap {
         let map = self.inner.lock().expect("lock");
         if let Some(lim) = map.get(&record.endpoint_id) {
             lim.apply(cfg, record.revision, now);
+            lim.set_network_exempt(Some(record));
         }
     }
 
@@ -393,8 +440,15 @@ impl LimiterMap {
         defaults: &Defaults,
         now: Instant,
     ) {
-        for r in records {
-            self.apply_record(r, defaults, now);
+        let map = self.inner.lock().expect("lock");
+        for (id, limiter) in map.iter() {
+            let record = records.iter().find(|r| &r.endpoint_id == id);
+            limiter.set_network_exempt(record);
+            limiter.apply(
+                resolve_effective(record, defaults),
+                record.map(|r| r.revision).unwrap_or(0),
+                now,
+            );
         }
     }
 
@@ -576,10 +630,57 @@ mod tests {
         rec.speed_policy = crate::policy::SpeedPolicy::Unlimited;
         rec.revision += 1;
         map.apply_record(&rec, &d, start);
+        assert!(lim.network_exempt());
         rec.speed_policy = crate::policy::SpeedPolicy::Default;
         rec.revision += 1;
         map.apply_record(&rec, &d, start);
+        assert!(!lim.network_exempt());
         // Balance is at most the small remainder, not a fresh burst.
         assert!(lim.consume_rx(1_000, start).is_some());
+    }
+
+    #[test]
+    fn registry_bound_pins_live_entries_and_reclaims_only_replenished_idle_entries() {
+        let now = Instant::now();
+        let map = LimiterMap::new();
+        let defaults = Defaults {
+            rx_bps: Some(1),
+            tx_bps: Some(1),
+        };
+        let a = map.try_get_or_create("a", None, &defaults, now, 2).unwrap();
+        let b = map.try_get_or_create("b", None, &defaults, now, 2).unwrap();
+        b.consume_rx(5000, now);
+        drop(b);
+        assert!(map.try_get_or_create("c", None, &defaults, now, 2).is_err());
+        assert!(map
+            .try_get_or_create("c", None, &defaults, now + Duration::from_secs(601), 2)
+            .is_err());
+        assert!(map
+            .try_get_or_create("c", None, &defaults, now + Duration::from_secs(5000), 2)
+            .is_ok());
+        assert_eq!(map.len(), 2);
+        assert!(!a.network_exempt());
+    }
+
+    #[test]
+    fn source_exemption_requires_explicit_approved_unlimited_policy() {
+        let now = Instant::now();
+        let map = LimiterMap::new();
+        let d = Defaults::default();
+        let mut rec = crate::policy::EndpointPolicy::new("a".into(), "".into());
+        rec.approved = true;
+        rec.speed_policy = crate::policy::SpeedPolicy::Custom;
+        let a = map.get_or_create("a", Some(&rec), &d, now);
+        let b = map.get_or_create("b", None, &d, now);
+        assert!(!a.network_exempt());
+        rec.speed_policy = crate::policy::SpeedPolicy::Unlimited;
+        rec.revision += 1;
+        map.apply_record(&rec, &d, now);
+        assert!(a.network_exempt());
+        assert!(!b.network_exempt());
+        rec.approved = false;
+        rec.revision += 1;
+        map.apply_record(&rec, &d, now);
+        assert!(!a.network_exempt());
     }
 }

@@ -2,10 +2,9 @@
 
 ## Supported versions
 
-Relay Warden is pre-release. Security fixes are developed on `main`; there
-are no maintained stable release branches or guaranteed backports yet.
+Use the latest release for security fixes. Older releases do not have
+guaranteed backports or separately maintained stable branches.
 If you use a development build, record its commit and keep it up to date.
-Do not assume older snapshots receive security updates.
 
 ## Reporting a vulnerability
 
@@ -17,8 +16,7 @@ Email [support@sudosy.fr](mailto:support@sudosy.fr) with the subject
 live credentials or data belonging to other users.
 
 You may also use **Security → Report a vulnerability** on GitHub if that
-option is available. Its availability has not been verified for this
-checkout; email is the documented reporting channel.
+option is available. Email is always the documented reporting channel.
 
 A useful private report includes:
 

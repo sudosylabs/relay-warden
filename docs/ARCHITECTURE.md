@@ -12,7 +12,7 @@ patches, no private APIs). The public HTTPS proxy stays shared
 infrastructure; the relay itself binds loopback behind it.
 
 ```text
-Approved Iroh clients
+Iroh clients (public by default; optional token/approval)
        |
        | HTTPS /relay
        v
@@ -34,18 +34,21 @@ Custom relay on loopback
 Private admin API/UI + metrics + quota supervisor
 ```
 
-Request path per connection: negotiate the WebSocket subprotocol (V2
+Request path per connection: resolve the source IP from the socket or an
+explicitly trusted proxy, reserve IP/prefix/global connection capacity and
+enforce connection-attempt limits, then negotiate the WebSocket subprotocol (V2
 preferred, V1 accepted, anything else rejected), wrap the socket in our
 byte-stream adapter, run upstream `handshake::serverside`, authorize
-against the current approval policy, attach the shared per-endpoint
-limiter, register with the single shared `Clients` registry. Handshake
+against the configured token and endpoint-approval gates, attach the shared per-endpoint
+limiter and source-network/global buckets, register with the single shared `Clients` registry. Handshake
 traffic flows unshaped; shaping and budget gating engage after
 authorization. Behind a TLS-terminating edge there is no exporter keying
 material, so authentication uses the signed-challenge fallback, exactly as
 upstream's own embedding example does.
 
 Module map: `relay` (protocol/adapter), `policy` (records, admission,
-revocation), `limiter` (directional buckets), `quota` (monthly ledger),
+revocation), `limiter` (directional buckets), `network` (bounded source admission
+and aggregate buckets), `quota` (monthly ledger),
 `store` (SQLite on a worker thread), `admin` (private API/UI), `service`
 (multi-step update coordinator), `config`, `observability` via
 `/admin/status` + `/admin/metrics`.
@@ -56,8 +59,9 @@ An **endpoint ID** is the public key of one app instance (client-proven via
 the upstream relay handshake: signed challenge, or signed TLS-exporter key
 material when the edge preserves it). It is not an IP, account, or device.
 
-- Unknown IDs are denied by default. Approval is an explicit admin record.
-- A key reset creates a *new* identity requiring fresh approval.
+- Unknown IDs are allowed by default, with endpoint and network limits.
+- When approval is enabled, unknown IDs are denied until explicitly approved.
+- A key reset creates a new identity, but does not reset IP/prefix allowances.
 - Revocation publishes deny, then disconnects existing connections; a
   post-register revalidation closes the auth/register race for in-flight
   admissions. Reconnect stays denied. Live throttled transfers are cut the
@@ -79,6 +83,18 @@ that endpoint's connections (duplicates included):
   bucket independently. Reconfigurations clamp balances down, never mint;
   reconnects reuse the surviving limiter; unlimited→limited transitions
   start empty.
+
+## Slow transfers and socket stalls
+
+Traffic shaping can deliberately delay a send for longer than upstream's
+two-second write timeout. The adapter therefore applies that deadline only to
+pending socket readiness, flushing, and closing, not to limiter or quota waits.
+The upstream whole-send timeout is disabled; a slow but permitted transfer stays
+connected, while a stalled socket still fails after two seconds. This does not
+add an unbounded send queue.
+Adapters also subscribe to policy disconnect notifications, so revocation and
+quota exhaustion interrupt a pending shaped send without waiting for its bucket
+to refill.
 
 ## Accounting units and cutoff precision
 
@@ -102,6 +118,35 @@ already reserved, so delivered bytes can never exceed durable charges; bytes
 already in kernel/proxy buffers at exhaustion were all granted beforehand.
 A packet-exact network cap would need kernel-level accounting and is
 explicitly not claimed.
+
+## Administration and access requests
+
+`web/admin.html`, `web/admin.css` and `web/admin.js` are separate frontend
+sources, embedded at build time into the same executable. Axum serves
+the assets and authenticated data APIs; no frontend runtime or second
+server is needed. Dynamic content is rendered with DOM text nodes, not
+HTML interpolation. A session endpoint restores cookie authentication and
+the CSRF token after reload; logout clears both the server session and
+loaded client-side data. A restrictive content security policy and
+no-store responses cover the admin interface.
+
+Sidebar links use URL fragments (`#/devices`, `#/settings`, etc.), so
+reload, direct links and browser history select the same section. Device
+search is encoded in the fragment query (`#/devices?q=laptop`). Navigation
+Device, request and activity pagination is server-backed (20 entries per
+page in the UI) and preserved in the fragment query (`#/activity?page=2`).
+Device search resets pagination to page 1. Navigation state is not coupled to credentials or browser storage; unsaved form drafts
+are deliberately not persisted across reload.
+
+`admission` holds the startup access policy and a bounded observation
+cache. After the upstream handshake verifies an endpoint identity, the
+relay captures its socket-peer IP and records an eligible attempt. Invalid
+tokens are rejected before creating observations. Pending requests are
+derived from observations of unsaved identities when approval is required;
+durable approval uses the ordinary versioned endpoint-write path. No
+database write is performed for an incoming request. Observations are
+ephemeral, expire after 24 hours, and stop admitting new identities at
+1,000 entries. Revocations remain effective in every access mode.
 
 ## Identity spelling
 

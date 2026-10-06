@@ -44,8 +44,29 @@ Build the server and example client:
 cargo build --locked --bin relay-warden --example relayed_transfer
 ```
 
-The [README](README.md#try-it-locally) walks through a local trial with fresh
-state. No Oracle account, production server or cloud credentials are needed.
+For a local trial, start the server with fresh state:
+
+```sh
+WARDEN_BIN="$PWD/target/debug/relay-warden"
+WARDEN_DIR="$(mktemp -d)"
+mkdir -m 700 "$WARDEN_DIR/state"
+(umask 077; head -c 32 /dev/urandom | base64 > "$WARDEN_DIR/state/admin.token")
+cp deploy/config.local.example.toml "$WARDEN_DIR/warden.toml"
+printf 'Trial directory: %s\n' "$WARDEN_DIR"
+(cd "$WARDEN_DIR" && "$WARDEN_BIN" --config warden.toml)
+```
+
+Leave that terminal running. Open `http://127.0.0.1:8081/admin/` and sign in
+with the trial directory's `state/admin.token`. In another terminal at the
+repository root, run:
+
+```sh
+./target/debug/examples/relayed_transfer --relay http://127.0.0.1:8080
+```
+
+Expect `relayed transfer OK`. This trial uses public access, a 100 MB budget,
+and 1 MB/s limits. Stop it with Ctrl-C. No production server or cloud
+credentials are needed; [the dashboard guide](docs/USAGE.md) explains the UI.
 
 ## Tests and checks
 
@@ -88,7 +109,7 @@ Prefer clear names and small changes over speculative abstractions. Preserve
 fail-closed behavior for approval and quota enforcement; test both successful
 and denied paths. See [architecture](docs/ARCHITECTURE.md) for module boundaries.
 
-The UI is embedded in `src/admin.rs` (`ui_handler`). Keep dynamic strings
+The UI assets live in `web/` and are served by `src/admin.rs`. Keep dynamic strings
 in `textContent`, never `innerHTML`; keep every control wired to an
 existing API route (add the route, handler, and a `tests/admin.rs` case
 together). Run `scripts/check-ui.sh` and exercise the control in a browser.

@@ -33,6 +33,7 @@ sed -e "s#^listen = .*#listen = \"127.0.0.1:$PORT_R\"#" \
     -e "s#^admin_token_file = .*#admin_token_file = \"$WORK/admin.token\"#" \
     -e "s#^quota_budget_bytes = .*#quota_budget_bytes = 100000000#" \
     -e "s#^quota_headroom_bytes = .*#quota_headroom_bytes = 1000000#" \
+    -e 's/^require_endpoint_approval = .*/require_endpoint_approval = true/' \
     "$DIR/warden.example.toml" > "$WORK/warden.toml"
 
 "$DIR/relay-warden" --config "$WORK/warden.toml" & SRV=$!

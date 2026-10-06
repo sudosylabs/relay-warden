@@ -71,6 +71,7 @@ pub struct RelayState {
     /// Global concurrent-connection ceiling (Gate E). Permits are held by
     /// connection adapters for the connection lifetime. `None` = unbounded.
     pub conn_permits: Option<Arc<tokio::sync::Semaphore>>,
+    pub network: Option<Arc<crate::network::NetworkGuard>>,
 }
 
 impl RelayState {
@@ -91,6 +92,7 @@ impl RelayState {
             limiter: None,
             quota: None,
             conn_permits: None,
+            network: None,
         }
     }
 
@@ -113,6 +115,11 @@ impl RelayState {
 
     pub fn with_connection_limit(mut self, max: usize) -> Self {
         self.conn_permits = Some(Arc::new(tokio::sync::Semaphore::new(max.max(1))));
+        self
+    }
+
+    pub fn with_network(mut self, network: Arc<crate::network::NetworkGuard>) -> Self {
+        self.network = Some(network);
         self
     }
 }
@@ -154,7 +161,12 @@ async fn serve_inner(
     state: RelayState,
 ) -> n0_error::Result<AbortOnDropHandle<()>> {
     let task = tokio::spawn(async move {
-        if let Err(e) = axum::serve(listener, router(state).into_make_service()).await {
+        if let Err(e) = axum::serve(
+            listener,
+            router(state).into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        {
             warn!("axum serve error: {e:#}");
         }
     });
@@ -172,9 +184,12 @@ pub async fn serve_graceful_on(
     state: RelayState,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
-    axum::serve(listener, router(state).into_make_service())
-        .with_graceful_shutdown(shutdown)
-        .await
+    axum::serve(
+        listener,
+        router(state).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown)
+    .await
 }
 
 /// Bind loopback (or configured) address and serve. Returns bound addr + task.
@@ -211,6 +226,38 @@ async fn relay_handler(
     request: axum::extract::Request,
 ) -> Result<Response, StatusCode> {
     let (mut parts, _body) = request.into_parts();
+    let network_lease = if let Some(network) = &state.network {
+        let peer = parts
+            .extensions
+            .get::<axum::extract::ConnectInfo<SocketAddr>>()
+            .ok_or(StatusCode::BAD_REQUEST)?
+            .0
+            .ip();
+        let ip = network
+            .config()
+            .source_ip(peer, &parts.headers)
+            .map_err(|_| StatusCode::BAD_REQUEST)?;
+        // Observations and network enforcement must use the same trusted IP.
+        parts.extensions.insert(SourceIp(ip));
+        Some(
+            network
+                .admit(ip, std::time::Instant::now())
+                .map_err(|_| StatusCode::TOO_MANY_REQUESTS)?,
+        )
+    } else {
+        None
+    };
+    let connection_permit = state
+        .conn_permits
+        .as_ref()
+        .map(|s| s.clone().try_acquire_owned())
+        .transpose()
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let handshake_permit = state
+        .handshake_semaphore
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     let offered = parts
         .headers
         .get(axum::http::header::SEC_WEBSOCKET_PROTOCOL)
@@ -224,18 +271,23 @@ async fn relay_handler(
         .await
         .map_err(|_| StatusCode::BAD_REQUEST)?;
     // Echo back only the negotiated version.
-    let ws = ws.protocols([version.to_str()]);
+    let ws = ws
+        .protocols([version.to_str()])
+        .max_message_size(iroh_relay::MAX_PACKET_SIZE + 1024)
+        .max_frame_size(iroh_relay::MAX_PACKET_SIZE + 1024);
     Ok(ws.on_upgrade(move |socket| async move {
         // Bound unauthenticated work.
-        let _permit = match state.handshake_semaphore.clone().try_acquire_owned() {
-            Ok(p) => p,
-            Err(_) => {
-                warn!("handshake concurrency exhausted, rejecting");
-                return;
-            }
-        };
+        let _permit = handshake_permit;
         let timeout = state.handshake_timeout;
-        let fut = handle_relay_websocket(socket, state, parts, client_auth_header, version);
+        let fut = handle_relay_websocket(
+            socket,
+            state,
+            parts,
+            client_auth_header,
+            version,
+            network_lease,
+            connection_permit,
+        );
         match tokio::time::timeout(timeout, fut).await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => warn!("relay websocket error: {e:#}"),
@@ -244,37 +296,63 @@ async fn relay_handler(
     }))
 }
 
+#[derive(Clone)]
+struct SourceIp(std::net::IpAddr);
+
 async fn handle_relay_websocket(
     socket: WebSocket,
     state: RelayState,
     request_parts: http::request::Parts,
     client_auth_header: Option<HeaderValue>,
     version: ProtocolVersion,
+    network_lease: Option<crate::network::ConnectionLease>,
+    connection_permit: Option<tokio::sync::OwnedSemaphorePermit>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut adapter = AxumWebSocketAdapter::new(socket, state.quota.clone());
+    adapter.conn_permit = connection_permit;
+    adapter.network_global = state.network.as_ref().map(|n| n.global());
+    adapter.network_lease = network_lease;
     let authentication = handshake::serverside(&mut adapter, client_auth_header).await?;
     debug!(?authentication.mechanism, version = ?version, "authenticated");
     let client_key = authentication.client_key;
+    let peer_ip = request_parts
+        .extensions
+        .get::<SourceIp>()
+        .map(|ip| ip.0)
+        .or_else(|| {
+            request_parts
+                .extensions
+                .get::<axum::extract::ConnectInfo<SocketAddr>>()
+                .map(|peer| peer.0.ip())
+        });
 
     let request = iroh_relay::server::ClientRequest::new(client_key, version, request_parts);
+    if let Some(policy) = &state.policy {
+        policy.observe_authenticated(&request, peer_ip);
+    }
     let guard = authentication
         .authorize_with(&request, &state.access, &mut adapter)
         .await?;
+    adapter.throttling = true;
+    if let Some(policy) = state.policy.clone() {
+        let mut changes = policy.disconnect_watcher();
+        adapter.disconnect_wait = Some(Box::pin(async move {
+            loop {
+                if !policy.connection_allowed(&client_key) {
+                    break;
+                }
+                if changes.changed().await.is_err() {
+                    break;
+                }
+            }
+        }));
+    }
     debug!("authorized");
 
     // Global connection ceiling (Gate E): the permit lives in the adapter,
     // so it is held for the whole connection and released on disconnect.
     // The authorization guard drops here on denial, keeping live counters
     // balanced.
-    if let Some(sem) = &state.conn_permits {
-        match sem.clone().try_acquire_owned() {
-            Ok(p) => adapter.hold_permit(p),
-            Err(_) => {
-                warn!("connection ceiling reached, rejecting");
-                return Err("too many connections".into());
-            }
-        }
-    }
 
     // Engage shaping after authorization: handshake traffic stays unthrottled.
     // The limiter is shared across all connections of this endpoint.
@@ -282,13 +360,27 @@ async fn handle_relay_websocket(
         let id = client_key.to_string();
         let record = policy.get(&id);
         let defaults = policy.defaults_snapshot();
-        let lim = limiter.get_or_create(&id, record.as_ref(), &defaults, std::time::Instant::now());
+        let lim = limiter.try_get_or_create(
+            &id,
+            record.as_ref(),
+            &defaults,
+            std::time::Instant::now(),
+            state
+                .network
+                .as_ref()
+                .map(|n| n.config().max_entries)
+                .unwrap_or(16_384),
+        )?;
         adapter.set_limiter(lim);
     }
 
     let stream = RelayedStream::new(adapter, state.key_cache.clone());
     let endpoint = guard.endpoint_id();
-    let config = ClientConfig::new(guard, stream, version);
+    let mut config = ClientConfig::new(guard, stream, version);
+    // The stock timeout wraps the complete send, including intentional
+    // shaping/quota waits. The adapter instead bounds actual socket stalls.
+    // Tokio treats an unrepresentable deadline as a far-future timeout.
+    config.write_timeout = StdDuration::MAX;
     state.clients.register(config, state.metrics.clone());
     // Close the revoke race: a revoke published between on_connect and
     // register must still kill this connection. Either this revalidation or
@@ -321,6 +413,11 @@ enum Direction {
 struct AxumWebSocketAdapter {
     inner: Pin<Box<WebSocket>>,
     limiter: Option<Arc<EndpointLimiter>>,
+    network_global: Option<Arc<EndpointLimiter>>,
+    network_lease: Option<crate::network::ConnectionLease>,
+    write_deadline: WriteDeadline,
+    disconnect_wait: Option<Pin<Box<dyn std::future::Future<Output = ()> + Send>>>,
+    disconnected: bool,
     quota: Option<QuotaClient>,
     /// False during the handshake (unthrottled, uncounted); enabled after authorization.
     throttling: bool,
@@ -339,7 +436,62 @@ struct AxumWebSocketAdapter {
     conn_permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
+/// A deadline for socket work only, never for policy backpressure. Readiness
+/// and flush each get a stall budget; successful completion clears it.
+#[derive(Default)]
+struct WriteDeadline {
+    sleep: Option<Pin<Box<tokio::time::Sleep>>>,
+}
+impl WriteDeadline {
+    fn pause(&mut self) {
+        self.sleep = None;
+    }
+    fn poll(
+        &mut self,
+        cx: &mut Context<'_>,
+        result: Poll<Result<(), StreamError>>,
+    ) -> Poll<Result<(), StreamError>> {
+        match result {
+            Poll::Pending => {
+                let sleep = self.sleep.get_or_insert_with(|| {
+                    Box::pin(tokio::time::sleep(
+                        iroh_relay::defaults::timeouts::SERVER_WRITE_TIMEOUT,
+                    ))
+                });
+                if sleep.as_mut().poll(cx).is_ready() {
+                    self.sleep = None;
+                    Poll::Ready(Err(AnyError::from_std(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "relay socket write stalled",
+                    ))))
+                } else {
+                    Poll::Pending
+                }
+            }
+            ready => {
+                self.pause();
+                ready
+            }
+        }
+    }
+}
+
 impl AxumWebSocketAdapter {
+    fn buckets(&self) -> Vec<Arc<EndpointLimiter>> {
+        let mut buckets = self.limiter.iter().cloned().collect::<Vec<_>>();
+        if let Some(global) = &self.network_global {
+            buckets.push(global.clone());
+        }
+        // Live endpoint updates immediately remove/restore the source speed
+        // exemption. Safety admission caps and global capacity still apply.
+        let exempt = self.limiter.as_ref().is_some_and(|l| l.network_exempt());
+        if !exempt {
+            if let Some(lease) = &self.network_lease {
+                buckets.extend(lease.bandwidth.iter().cloned());
+            }
+        }
+        buckets
+    }
     fn set_limiter(&mut self, limiter: Arc<EndpointLimiter>) {
         self.limiter = Some(limiter);
         self.throttling = true;
@@ -348,9 +500,7 @@ impl AxumWebSocketAdapter {
     /// Gate one direction. Peeks only; deducts happen in `poll_next` /
     /// `start_send`. Returns `Ready` when the frame may proceed.
     fn poll_gate(&mut self, cx: &mut Context<'_>, dir: Direction) -> Poll<()> {
-        let Some(lim) = self.limiter.clone() else {
-            return Poll::Ready(());
-        };
+        let buckets = self.buckets();
         if !self.throttling {
             return Poll::Ready(());
         }
@@ -360,19 +510,26 @@ impl AxumWebSocketAdapter {
         };
         loop {
             let now = std::time::Instant::now();
-            let wait = match dir {
-                Direction::Rx => lim.check_rx(now),
-                Direction::Tx => lim.check_tx(now),
-            };
+            let wait = buckets
+                .iter()
+                .filter_map(|lim| match dir {
+                    Direction::Rx => lim.check_rx(now),
+                    Direction::Tx => lim.check_tx(now),
+                })
+                .max();
             let Some(d) = wait else {
                 *sleep_slot = None;
-                lim.unsubscribe(self.wait_id);
+                for lim in &buckets {
+                    lim.unsubscribe(self.wait_id);
+                }
                 return Poll::Ready(());
             };
             if wait_start.is_none() {
                 *wait_start = Some(now);
             }
-            lim.subscribe(self.wait_id, cx.waker().clone());
+            for lim in &buckets {
+                lim.subscribe(self.wait_id, cx.waker().clone());
+            }
             let deadline = tokio::time::Instant::now() + d;
             *sleep_slot = Some(Box::pin(tokio::time::sleep_until(deadline)));
             if sleep_slot
@@ -485,6 +642,14 @@ impl Drop for AxumWebSocketAdapter {
         if let Some(lim) = &self.limiter {
             lim.unsubscribe(self.wait_id);
         }
+        if let Some(global) = &self.network_global {
+            global.unsubscribe(self.wait_id);
+        }
+        if let Some(lease) = &self.network_lease {
+            for lim in &lease.bandwidth {
+                lim.unsubscribe(self.wait_id);
+            }
+        }
         // Hand back the proven-unspent lease remainder, tagged with its
         // granting generation. Best effort: if the actor is gone the bytes
         // stay charged (conservative, fail-closed).
@@ -497,10 +662,27 @@ impl Drop for AxumWebSocketAdapter {
 }
 
 impl AxumWebSocketAdapter {
+    fn poll_disconnected(&mut self, cx: &mut Context<'_>) -> bool {
+        if self
+            .disconnect_wait
+            .as_mut()
+            .is_some_and(|wait| wait.as_mut().poll(cx).is_ready())
+        {
+            self.disconnect_wait = None;
+            self.disconnected = true;
+        }
+        self.disconnected
+    }
+
     fn new(socket: WebSocket, quota: Option<QuotaClient>) -> Self {
         Self {
             inner: Box::pin(socket),
             limiter: None,
+            network_global: None,
+            network_lease: None,
+            write_deadline: WriteDeadline::default(),
+            disconnect_wait: None,
+            disconnected: false,
             quota,
             throttling: false,
             wait_id: NEXT_WAIT_ID.fetch_add(1, Ordering::Relaxed),
@@ -515,16 +697,15 @@ impl AxumWebSocketAdapter {
             conn_permit: None,
         }
     }
-
-    fn hold_permit(&mut self, permit: tokio::sync::OwnedSemaphorePermit) {
-        self.conn_permit = Some(permit);
-    }
 }
 
 impl Stream for AxumWebSocketAdapter {
     type Item = Result<Bytes, StreamError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.poll_disconnected(cx) {
+            return Poll::Ready(None);
+        }
         // Gate first: do not read from the network while overdrawn, so
         // backpressure reaches the sender. At most one frame is buffered.
         if self.throttling && self.poll_gate(cx, Direction::Rx).is_pending() {
@@ -542,9 +723,11 @@ impl Stream for AxumWebSocketAdapter {
         };
         // Deduct exactly once per delivered frame. Polls/retries never deduct.
         if self.throttling {
+            for bucket in self.buckets() {
+                bucket.consume_rx(frame.len(), std::time::Instant::now());
+            }
             if let Some(lim) = self.limiter.clone() {
                 let (waited, waited_ms) = self.take_waited_ms(Direction::Rx);
-                let _debt = lim.consume_rx(frame.len(), std::time::Instant::now());
                 if waited {
                     lim.record_throttled(frame.len(), waited_ms);
                 }
@@ -558,27 +741,39 @@ impl Sink<Bytes> for AxumWebSocketAdapter {
     type Error = StreamError;
 
     fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        if self.poll_disconnected(cx) {
+            return Poll::Ready(Err(AnyError::from_std(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "relay access withdrawn",
+            ))));
+        }
         // Gate delivery while overdrawn. Size is unknown here, so this peeks
         // only; the single deduct happens in `start_send`.
         if self.throttling && self.poll_gate(cx, Direction::Tx).is_pending() {
+            self.write_deadline.pause();
             return Poll::Pending;
         }
         // Budget gate: spend from the chunk lease (refills asynchronously).
         if self.throttling && self.poll_quota(cx).is_pending() {
+            self.write_deadline.pause();
             return Poll::Pending;
         }
-        self.inner
+        let result = self
+            .inner
             .as_mut()
             .poll_ready(cx)
-            .map_err(AnyError::from_std)
+            .map_err(AnyError::from_std);
+        self.write_deadline.poll(cx, result)
     }
 
     fn start_send(mut self: Pin<&mut Self>, item: Bytes) -> Result<(), Self::Error> {
         // Deduct exactly once per forwarded frame (never on flush/retry).
         if self.throttling {
+            for bucket in self.buckets() {
+                bucket.consume_tx(item.len(), std::time::Instant::now());
+            }
             if let Some(lim) = self.limiter.clone() {
                 let (waited, waited_ms) = self.take_waited_ms(Direction::Tx);
-                let _debt = lim.consume_tx(item.len(), std::time::Instant::now());
                 if waited {
                     lim.record_throttled(item.len(), waited_ms);
                 }
@@ -606,17 +801,21 @@ impl Sink<Bytes> for AxumWebSocketAdapter {
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.inner
+        let result = self
+            .inner
             .as_mut()
             .poll_flush(cx)
-            .map_err(AnyError::from_std)
+            .map_err(AnyError::from_std);
+        self.write_deadline.poll(cx, result)
     }
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.inner
+        let result = self
+            .inner
             .as_mut()
             .poll_close(cx)
-            .map_err(AnyError::from_std)
+            .map_err(AnyError::from_std);
+        self.write_deadline.poll(cx, result)
     }
 }
 
@@ -636,9 +835,45 @@ impl ExportKeyingMaterial for AxumWebSocketAdapter {
 
 #[cfg(test)]
 mod tests {
-    use super::negotiate_version;
+    use super::{negotiate_version, WriteDeadline};
     use axum::http::HeaderValue;
     use iroh_relay::http::ProtocolVersion;
+
+    #[tokio::test]
+    async fn socket_deadline_is_armed_only_for_pending_transport_work() {
+        let mut deadline = WriteDeadline::default();
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(deadline
+            .poll(&mut cx, std::task::Poll::Ready(Ok(())))
+            .is_ready());
+        assert!(deadline.sleep.is_none());
+        assert!(deadline
+            .poll(&mut cx, std::task::Poll::Pending)
+            .is_pending());
+        assert!(deadline.sleep.is_some());
+        deadline.pause(); // Policy backpressure is not a socket stall.
+        assert!(deadline.sleep.is_none());
+        assert!(deadline
+            .poll(&mut cx, std::task::Poll::Pending)
+            .is_pending());
+        assert!(deadline
+            .poll(&mut cx, std::task::Poll::Ready(Ok(())))
+            .is_ready());
+        assert!(deadline.sleep.is_none());
+    }
+
+    #[tokio::test]
+    async fn stalled_socket_errors_when_its_deadline_expires() {
+        let mut deadline = WriteDeadline {
+            sleep: Some(Box::pin(tokio::time::sleep(std::time::Duration::ZERO))),
+        };
+        let result = std::future::poll_fn(|cx| deadline.poll(cx, std::task::Poll::Pending)).await;
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("relay socket write stalled"));
+        assert!(deadline.sleep.is_none());
+    }
 
     #[test]
     fn negotiates_v2_preferred() {

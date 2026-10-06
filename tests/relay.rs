@@ -9,7 +9,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::{approve, expect_close, relay_connect, start, HarnessOptions};
+use common::{approve, relay_connect, start, HarnessOptions};
 use iroh_base::{EndpointId, RelayUrl, SecretKey};
 use iroh_dns::dns::DnsResolver;
 use iroh_relay::{
@@ -132,10 +132,32 @@ async fn relay_global_ceiling_drops_over_limit_without_service() {
     approve(&h, &b_id, serde_json::json!({})).await;
 
     let mut a = relay_connect(h.relay_addr, a_sk).await;
-    // B authenticates fine (the ceiling is checked after authorization so
-    // live counters stay balanced) but never obtains relay service.
-    let mut over = relay_connect(h.relay_addr, b_sk).await;
-    expect_close(&mut over, "over-ceiling connection").await;
+    // Capacity is now reserved before upgrade/authentication: an approved
+    // second endpoint is refused without occupying handshake resources.
+    let url: RelayUrl = format!("http://{}", h.relay_addr).parse().unwrap();
+    ClientBuilder::new(url, b_sk, DnsResolver::new())
+        .tls_client_config(
+            CaTlsConfig::default()
+                .client_config(default_provider())
+                .unwrap(),
+        )
+        .connect()
+        .await
+        .expect_err("over-ceiling connection must be refused");
+    let response = reqwest::Client::new()
+        .get(format!(
+            "http://{}{}",
+            h.relay_addr,
+            iroh_relay::http::RELAY_PATH
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 503);
+    assert_eq!(
+        common::endpoint_json(&h, &b_id).await["live_connections"],
+        0
+    );
 
     // The admitted connection is unaffected (still counted live).
     let entry = common::endpoint_json(&h, &a_id).await;

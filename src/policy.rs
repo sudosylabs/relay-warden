@@ -305,6 +305,8 @@ pub fn escape_html(s: &str) -> String {
 /// admit path revalidates after `register` via [`PolicyManager::revalidate`].
 #[derive(Debug)]
 pub struct PolicyManager {
+    admission: RwLock<crate::admission::AdmissionPolicy>,
+    observations: RwLock<crate::admission::Observations>,
     store: Arc<Store>,
     /// endpoint_id string -> record.
     cache: RwLock<HashMap<String, EndpointPolicy>>,
@@ -314,6 +316,9 @@ pub struct PolicyManager {
     defaults: RwLock<crate::limiter::Defaults>,
     /// Late-bound registry for post-register revalidation + revoke disconnect.
     clients: RwLock<Option<iroh_relay::server::clients::Clients>>,
+    /// Wake adapters even when upstream is waiting inside a shaped send.
+    disconnect_signal: tokio::sync::watch::Sender<()>,
+    stopping: AtomicBool,
     /// Shared exhaustion flag (Gate D). Read on the admission hot path so
     /// new connections are denied without SQLite I/O.
     quota_exhausted: RwLock<Option<Arc<AtomicBool>>>,
@@ -324,6 +329,7 @@ pub struct PolicyManager {
     /// these reset on restart by design).
     pub admitted_total: AtomicU64,
     pub denied_unknown_total: AtomicU64,
+    pub denied_token_total: AtomicU64,
     pub denied_quota_total: AtomicU64,
     pub denied_busy_total: AtomicU64,
 }
@@ -336,15 +342,20 @@ impl PolicyManager {
             map.insert(e.endpoint_id.clone(), e);
         }
         let mgr = Arc::new(Self {
+            admission: RwLock::new(crate::admission::AdmissionPolicy::default()),
+            observations: RwLock::new(crate::admission::Observations::default()),
             store,
             cache: RwLock::new(map),
             live: RwLock::new(HashMap::new()),
             defaults: RwLock::new(crate::limiter::Defaults::default()),
             clients: RwLock::new(None),
+            disconnect_signal: tokio::sync::watch::channel(()).0,
+            stopping: AtomicBool::new(false),
             quota_exhausted: RwLock::new(None),
             max_per_endpoint: RwLock::new(Some(16)),
             admitted_total: AtomicU64::new(0),
             denied_unknown_total: AtomicU64::new(0),
+            denied_token_total: AtomicU64::new(0),
             denied_quota_total: AtomicU64::new(0),
             denied_busy_total: AtomicU64::new(0),
         });
@@ -354,6 +365,62 @@ impl PolicyManager {
 
     pub fn set_quota_exhausted(&self, flag: Option<Arc<AtomicBool>>) {
         *self.quota_exhausted.write().expect("lock") = flag;
+    }
+
+    /// Startup-only configuration; token changes require a process restart.
+    pub fn configure_admission(&self, policy: crate::admission::AdmissionPolicy) {
+        *self.admission.write().expect("lock") = policy;
+    }
+
+    pub fn access_summary(&self) -> serde_json::Value {
+        let p = self.admission.read().expect("lock");
+        serde_json::json!({"token_required": p.token_required(), "approval_required": p.require_approval})
+    }
+
+    pub fn pending(&self) -> Vec<crate::admission::Observation> {
+        if !self.admission.read().expect("lock").require_approval {
+            return Vec::new();
+        }
+        self.observed_unknown()
+    }
+
+    pub fn observed_unknown(&self) -> Vec<crate::admission::Observation> {
+        let cache = self.cache.read().expect("lock");
+        self.observations
+            .write()
+            .expect("lock")
+            .list()
+            .into_iter()
+            .filter(|o| !cache.contains_key(&o.endpoint_id))
+            .collect()
+    }
+
+    pub fn observation(&self, id: &str) -> Option<crate::admission::Observation> {
+        self.observations.write().expect("lock").get(id)
+    }
+
+    /// Called by the relay after Iroh has verified possession of the endpoint
+    /// secret key. Never enqueue invalid-token or quota-exhausted attempts.
+    pub fn observe_authenticated(&self, request: &ClientRequest, ip: Option<std::net::IpAddr>) {
+        if self.quota_exhausted()
+            || !self
+                .admission
+                .read()
+                .expect("lock")
+                .accepts_token(request.auth_token().as_deref())
+        {
+            return;
+        }
+        self.observations
+            .write()
+            .expect("lock")
+            .record(canonical_endpoint_id(&request.endpoint_id()), ip);
+    }
+
+    pub fn dismiss_pending(&self, id: &str) -> Result<(), String> {
+        let id = canonicalize_endpoint_id(id)?;
+        self.observations.write().expect("lock").remove(&id);
+        Ok(())
     }
 
     /// Operator-tunable per-endpoint connection ceiling.
@@ -374,9 +441,10 @@ impl PolicyManager {
     /// exhaustion (including owner endpoints). Unknown IDs return false and
     /// are skipped; in-flight admissions are caught by `revalidate`.
     pub fn disconnect_all(&self) {
+        self.disconnect_signal.send_replace(());
         if let Some(c) = self.clients.read().expect("lock").clone() {
             let ids: Vec<EndpointId> = self
-                .cache
+                .live
                 .read()
                 .expect("lock")
                 .keys()
@@ -386,6 +454,13 @@ impl PolicyManager {
                 c.disconnect(id, None);
             }
         }
+    }
+
+    /// Withdraw access before draining upstream clients, including adapters
+    /// currently parked inside a shaped send. This manager cannot reopen.
+    pub fn stop_connections(&self) {
+        self.stopping.store(true, Ordering::Relaxed);
+        self.disconnect_all();
     }
 
     /// Re-read ordinary defaults from settings. Called at startup and after
@@ -420,7 +495,15 @@ impl PolicyManager {
             .expect("lock")
             .get(&key)
             .map(|e| e.approved)
-            .unwrap_or(false)
+            .unwrap_or_else(|| !self.admission.read().expect("lock").require_approval)
+    }
+
+    pub(crate) fn disconnect_watcher(&self) -> tokio::sync::watch::Receiver<()> {
+        self.disconnect_signal.subscribe()
+    }
+
+    pub(crate) fn connection_allowed(&self, id: &EndpointId) -> bool {
+        !self.stopping.load(Ordering::Relaxed) && self.is_approved(id) && !self.quota_exhausted()
     }
 
     /// Upsert + publish to cache. Returns the stored record.
@@ -467,6 +550,7 @@ impl PolicyManager {
             .expect("lock")
             .insert(endpoint_id.to_string(), rec.clone());
         let had_live = self.live_count(&endpoint_id) > 0;
+        self.disconnect_signal.send_replace(());
         if let Ok(id) = endpoint_id.parse::<EndpointId>() {
             if let Some(c) = self.clients.read().expect("lock").clone() {
                 c.disconnect(id, None);
@@ -534,6 +618,22 @@ impl PolicyManager {
 
 impl AccessControl for PolicyManager {
     async fn on_connect(&self, request: &ClientRequest) -> Access {
+        if self.stopping.load(Ordering::Relaxed) {
+            return Access::Deny {
+                reason: Some("relay is stopping".into()),
+            };
+        }
+        if !self
+            .admission
+            .read()
+            .expect("lock")
+            .accepts_token(request.auth_token().as_deref())
+        {
+            self.denied_token_total.fetch_add(1, Ordering::Relaxed);
+            return Access::Deny {
+                reason: Some("invalid relay access token".into()),
+            };
+        }
         // Exhaustion denies new admissions first (fail-closed, no SQLite here).
         if self.quota_exhausted() {
             self.denied_quota_total.fetch_add(1, Ordering::Relaxed);

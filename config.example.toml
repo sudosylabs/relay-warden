@@ -18,7 +18,7 @@ require_default_limits = true
 # require_quota_budget = false (tests/dev). Enforcement is on *charged* bytes
 # (payload + overhead allowance), with an earlier effective cutoff at
 # budget - headroom. Charged bytes are relay accounting, not cloud billing.
-quota_budget_bytes = 6_000_000_000_000
+quota_budget_bytes = 100_000_000_000 # Illustrative 100 GB; choose your own budget.
 quota_headroom_bytes = 1_000_000_000
 quota_overhead_pct = 10
 quota_chunk_bytes = 32768
@@ -28,3 +28,35 @@ require_quota_budget = true
 admin_listen = "127.0.0.1:8081"
 # File containing the high-entropy admin token (chmod 0600). No default.
 admin_token_file = "admin.token"
+
+# Access policy: independent of speed limits and the monthly budget.
+# Public by default, with endpoint and source-network limits.
+require_endpoint_approval = false
+# Optional: require an Iroh bearer token as well. Generate a separate secret;
+# never give relay clients the admin token. Missing/short files fail startup.
+# relay_token_file = "relay.token"
+
+# Shared source-network limits (bytes/sec), in addition to endpoint caps.
+# Starting values, not equivalents of Iroh's public relay limits.
+[network]
+ip_rx_bps = 1_000_000
+ip_tx_bps = 1_000_000
+prefix_rx_bps = 5_000_000
+prefix_tx_bps = 5_000_000
+global_rx_bps = 10_000_000
+global_tx_bps = 10_000_000
+ipv6_prefix = 64
+ipv6_prefix_enabled = true
+# IPv4 subnet grouping is off unless explicitly configured.
+# ipv4_prefix = 24
+attempts_per_second = 5
+attempt_burst = 20
+prefix_attempts_per_second = 20
+prefix_attempt_burst = 80
+global_attempts_per_second = 100
+global_attempt_burst = 200
+max_connections_per_ip = 64
+max_connections_per_prefix = 256
+max_entries = 16384
+# Only trust socket IPs of proxies you control; otherwise ignore headers.
+trusted_proxies = []

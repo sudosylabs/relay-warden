@@ -2,7 +2,7 @@
 name = "relay-warden"
 version = "0.1.0"
 edition = "2021"
-description = "Private Iroh relay with endpoint approval, per-endpoint limits, and shared monthly budget. Generic, self-hostable."
+description = "Self-hosted Iroh relay with layered rate limits, optional access control, and a shared monthly budget."
 license = "Apache-2.0"
 readme = "README.md"
 rust-version = "1.91"

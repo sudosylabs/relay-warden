@@ -16,7 +16,9 @@ REQUIRED = {"relay-warden", "warden.example.toml", "relay-warden.service",
             "THIRD_PARTY_NOTICES.md", "DEPENDENCY_LICENSES.txt", "BUILD.json",
             "licenses/upstream/iroh-LICENSE-MIT", "licenses/upstream/iroh-LICENSE-APACHE",
             "licenses/upstream/iroh-relay-LICENSE-BSD3", "docs/OPERATIONS.md",
-            "docs/CONFIGURATION.md", "docs/API.md", "docs/INSTALL.md"}
+            "docs/CONFIGURATION.md", "docs/API.md", "docs/INSTALL.md",
+            "docs/USAGE.md", "docs/ARCHITECTURE.md", "docs/images/deployment.svg", "README.md",
+            "SECURITY.md", "CODE_OF_CONDUCT.md"}
 
 
 def metadata(tag=None):

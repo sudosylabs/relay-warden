@@ -38,6 +38,9 @@ pub struct QuotaOpts {
 
 #[derive(Debug, Clone, Default)]
 pub struct HarnessOptions {
+    pub network: Option<relay_warden::network::NetworkConfig>,
+    pub public_access: bool,
+    pub relay_token: Option<String>,
     /// Ordinary (default-policy) throughput limits. `None` = unconfigured.
     pub ordinary_limits: Option<(u64, u64)>,
     /// Monthly budget gate. `None` = disabled (passthrough).
@@ -49,6 +52,7 @@ pub struct HarnessOptions {
 }
 
 pub struct Harness {
+    pub limiter: Arc<LimiterMap>,
     pub relay_addr: SocketAddr,
     pub admin_addr: SocketAddr,
     pub token: String,
@@ -97,6 +101,10 @@ pub async fn start(opts: HarnessOptions) -> Harness {
         ))
     });
     let policy = PolicyManager::open(store.clone()).await.unwrap();
+    policy.configure_admission(relay_warden::admission::AdmissionPolicy::new(
+        !opts.public_access,
+        opts.relay_token.map(String::into_bytes),
+    ));
     if let Some(cap) = opts.max_per_endpoint {
         policy.set_max_per_endpoint(cap);
     }
@@ -118,6 +126,11 @@ pub async fn start(opts: HarnessOptions) -> Harness {
     )
     .with_policy(policy.clone())
     .with_limiter(limiter.clone());
+    if let Some(network) = opts.network {
+        relay_state = relay_state.with_network(
+            relay_warden::network::NetworkGuard::new(network, std::time::Instant::now()).unwrap(),
+        );
+    }
     if let Some(q) = &quota {
         relay_state = relay_state.with_quota(q.client());
     }
@@ -146,6 +159,7 @@ pub async fn start(opts: HarnessOptions) -> Harness {
     let _admin_handle = n0_future::task::AbortOnDropHandle::new(task);
 
     Harness {
+        limiter,
         relay_addr,
         admin_addr,
         token,

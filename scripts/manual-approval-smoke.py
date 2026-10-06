@@ -10,7 +10,7 @@ from pathlib import Path
 
 def run(client_path, relay, admin, token_file):
     token = Path(token_file).read_text().strip()
-    client = subprocess.Popen([client_path, "--relay", relay], stdin=subprocess.PIPE,
+    client = subprocess.Popen([client_path, "--relay", relay, "--request-access"], stdin=subprocess.PIPE,
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     lines = queue.Queue()
 
@@ -31,6 +31,21 @@ def run(client_path, relay, admin, token_file):
             seen.append(line)
             if line.startswith(("endpoint A: ", "endpoint B: ")):
                 ids.append(line.split(": ", 1)[1].strip())
+        while not any("Press Enter to connect." in line for line in seen):
+            line = lines.get(timeout=15)
+            if line is None:
+                raise RuntimeError("client stopped before requesting approval")
+            seen.append(line)
+        if sum("connection refused;" in line for line in seen) != 2:
+            raise RuntimeError("both unknown endpoints must be denied before approval")
+        request = urllib.request.Request(
+            f"{admin}/admin/pending",
+            headers={"Authorization": f"Bearer {token}"})
+        with urllib.request.urlopen(request, timeout=5) as response:
+            pending = json.load(response)
+        if pending["mode"] != "requests" or not set(ids).issubset(
+                {entry["endpoint_id"] for entry in pending["requests"]}):
+            raise RuntimeError("denied endpoints did not appear in access requests")
         if client.poll() is not None:
             raise RuntimeError("manual client did not wait for approval")
         for endpoint in ids:

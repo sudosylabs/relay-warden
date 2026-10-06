@@ -100,8 +100,24 @@ async fn main() -> anyhow::Result<()> {
 
     // Fail closed when the secret file is missing (no default password).
     let token = admin::load_admin_token(&cfg.admin_token_file).map_err(|e| anyhow::anyhow!(e))?;
+    let relay_token = cfg
+        .relay_token_file
+        .as_deref()
+        .map(admin::load_admin_token)
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("relay token: {e}"))?;
+    if relay_token.as_ref().is_some_and(|t| t == &token) {
+        anyhow::bail!("relay-access and admin tokens must be different");
+    }
+    policy.configure_admission(relay_warden::admission::AdmissionPolicy::new(
+        cfg.require_endpoint_approval,
+        relay_token,
+    ));
 
     let limiter = LimiterMap::new();
+    let network =
+        relay_warden::network::NetworkGuard::new(cfg.network.clone(), std::time::Instant::now())
+            .map_err(anyhow::Error::msg)?;
     let mut relay_state = relay::RelayState::new(
         policy.clone() as Arc<dyn iroh_relay::server::DynAccessControl>,
         cfg.key_cache_capacity,
@@ -110,6 +126,7 @@ async fn main() -> anyhow::Result<()> {
     )
     .with_policy(policy.clone())
     .with_limiter(limiter.clone())
+    .with_network(network.clone())
     .with_connection_limit(cfg.max_connections);
     let relay_clients = relay_state.clients.clone();
 
@@ -148,7 +165,8 @@ async fn main() -> anyhow::Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("relay bind: {e:#}"))?;
     let relay_addr = relay_listener.local_addr()?;
-    let admin_state = admin::AdminState::new(policy, limiter.clone(), quota.clone(), token);
+    let admin_state = admin::AdminState::new(policy.clone(), limiter.clone(), quota.clone(), token)
+        .with_network(network);
     let admin_app = admin::router(admin_state);
     let admin_listener = tokio::net::TcpListener::bind(cfg.admin_listen).await?;
     let admin_addr = admin_listener.local_addr()?;
@@ -190,6 +208,7 @@ async fn main() -> anyhow::Result<()> {
     // proven-unspent lease remainders), then the ledger actor confirms every
     // queued write persisted. Systemd's TimeoutStopSec bounds this sequence.
     stop.cancel();
+    policy.stop_connections();
     limiter.wake_all();
     relay_clients.shutdown().await;
     if let Some(q) = quota {

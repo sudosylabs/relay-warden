@@ -1,124 +1,175 @@
-# relay-warden operations guide
+# Troubleshooting and maintenance
 
-Runbook for installing, serving, and recovering a relay. Stopping,
-replacing, or reconfiguring a live service is always disruptive — plan a
-maintenance window; the rollback section below is part of that plan.
+[Deploy](INSTALL.md) → [Use](USAGE.md) → Maintain
 
-## Layout (operator-chosen paths)
+Use this page after installation. Commands run on the server unless marked
+otherwise. Restarts disconnect clients and end admin sessions.
 
-- Binary: `/opt/relay-warden/relay-warden`
-- Config: `/etc/relay-warden/warden.toml` (see the production example shipped in the archive)
-- State dir: `/var/lib/relay-warden/` (`warden.db`, `admin.token` 0600)
-- Service: `deploy/relay-warden.service` (example unit)
+## A connection is not working
 
-## Fresh install
+Start with the service and its logs:
 
-Supported host: 64-bit Linux (x86-64 or ARM64) with glibc 2.39 or newer
-(Ubuntu 24.04 or equivalent). The release binaries are dynamically linked
-against the build runner's glibc — they do not run on musl-based or older
-systems; check `ldd --version` before installing elsewhere.
+```sh
+sudo systemctl status relay-warden --no-pager
+sudo journalctl -u relay-warden -n 50 --no-pager
+curl --fail http://127.0.0.1:8080/healthz
+```
 
-For complete copy-and-run installation commands, use the archive's `INSTALL.md`
-or the [installation guide](INSTALL.md) in the source tree.
+Then check the public route **from your computer**:
 
-1. Create the user and directories:
-   `useradd -r -s /usr/sbin/nologin relay-warden`
-   `install -d -o relay-warden -g relay-warden -m 0750 /var/lib/relay-warden`
-2. Generate the admin secret (never ship a default):
-   `head -c 32 /dev/urandom | base64 > /var/lib/relay-warden/admin.token`
-   `chmod 600 /var/lib/relay-warden/admin.token`
-   `chown relay-warden:relay-warden /var/lib/relay-warden/admin.token`
-3. Write `/etc/relay-warden/warden.toml` (copy the production example;
-   set `db_path`, `admin_token_file`, ordinary defaults, and the budget).
-4. Install the binary and unit, `systemctl daemon-reload`,
-   `systemctl enable --now relay-warden`.
-5. Health: `GET /healthz` on the relay port; authenticated
-   `GET /admin/status` on the admin socket (via SSH tunnel, see below).
-6. Approve the first endpoint ID, then verify a relayed transfer before
-   opening the proxy route.
+```sh
+curl --fail --include https://relay.example.com/ping
+```
 
-## Reverse proxy
+Replace the hostname. This route has an empty body; a valid HTTPS 200 is the
+expected result. It does not prove a relayed transfer works.
 
-Forward `/relay` (transport) and `/ping` (latency probe) to the loopback backend; keep everything else
-for existing services. Preserve WebSocket upgrades and the
-`Sec-WebSocket-Protocol` subprotocol (`iroh-relay-v1/v2`) plus the
-`X-Iroh-Relay-Client-Auth-V1` header. Do not buffer relay WebSockets.
-Examples: `deploy/caddy.example`, `deploy/nginx.example`.
-The Caddy example uses automatic HTTPS. The Nginx example needs an existing
-certificate and must be placed in the correct `http` context. Validate your
-edited proxy configuration before restarting it; these snippets are not a
-substitute for a public HTTPS/client compatibility test.
-Never route `/admin` or `/metrics` through the public edge: the admin
-listener stays loopback-only (SSH tunnel for remote access) precisely so a
-proxy misconfiguration cannot expose administration.
-UDP discovery stays off unless separately decided and implemented.
+| Symptom | Check next |
+|---|---|
+| Service refuses to start | Token file exists, service account can read it, default speeds and budget are configured |
+| Backend works but HTTPS fails | DNS, TCP 80/443 in both firewalls, certificate, and proxy logs |
+| `/ping` works but the app cannot relay | App's relay URL, WebSocket forwarding, token, access mode, and budget |
+| HTTP 400 on `/relay` | Iroh client subprotocol; if using a trusted proxy, valid `X-Forwarded-For` |
+| HTTP 429 | Shared IP/subnet attempt or connection limits; wait and avoid rapid retries |
+| HTTP 503 | Global connection or handshake capacity |
+| No access request appears | Correct relay URL, required token, non-exhausted budget; retry after a server restart |
+| All requests show `127.0.0.1` | Configure the local proxy IP in `[network].trusted_proxies` |
+| Saving a TOML speed/budget did nothing | Existing database settings win; use the dashboard |
+| Admin login expired | Reopen the SSH tunnel and sign in; sessions end on restart or after one hour |
 
-## Admin access
+For Caddy errors:
 
-The admin listener binds loopback by default. Remote administration goes over
-an SSH tunnel (`ssh -L 8081:127.0.0.1:8081 user@host`); direct remote admin
-exposure (separate hostname + auth) is an undecided production choice.
-Log in with the token from `admin.token`, which grants a short-lived
-session cookie + CSRF token.
+```sh
+sudo journalctl -u caddy -n 50 --no-pager
+```
 
-## Backup and restore
+A bare HTTP request to `/relay` is not a valid Iroh handshake. Use an Iroh
+client to test it. Also confirm your app is using a relayed path: direct
+peer-to-peer success does not exercise this server.
 
-- Backup: stop the service (or accept a WAL-checkpointed copy) and copy
-  `warden.db` (plus `-wal`/`-shm` if present) to versioned storage.
-- Restore replaces the ledger: **re-verify endpoint approvals afterwards**,
-  because a restore reverts later revocations. A restore also reverts
-  *usage*: spent bytes disappear and exhaustion flags clear, which recreates
-  spendable allowance. Never restore a database over a live ledger — see
-  Rollback for the supported recovery options.
-- A database stamped with a newer `user_version` is refused by older
-  binaries (fail-closed); upgrade the binary, never hand-edit the DB.
+## The relay feels slow
+
+Check **Overview** for budget state, then **Devices** and **Settings** for
+speed limits. Review IP/subnet/global limits in the TOML file.
+
+Device limits do not override shared limits. Users on one campus or home
+network may share an IP allowance. An unlimited approved device still shares
+the global limit. Broad IPv4 subnet grouping can group unrelated users;
+it is off by default.
+
+If traffic is comfortably below every limit, inspect server CPU, storage
+latency, and the proxy. Budget reservations wait for SQLite durability, so
+storage is part of the packet path. See
+[connection checks and latency](USAGE.md#connection-checks-and-latency).
+There is no measured capacity or latency guarantee.
+
+## The monthly budget ran out
+
+On **Overview**, check the current UTC month, charged usage, and effective
+cutoff. All relay connections close at cutoff; administration remains usable.
+
+Choose between waiting for the next UTC month or raising the budget in
+**Settings** after checking your provider's remaining allowance. Raising it
+does not erase recorded usage. Restarting also does not reset the ledger.
+
+Do not delete or restore the database to reopen a relay. That loses usage and
+can restore previously revoked access. Monitor the provider's total traffic
+separately: the ledger does not include other services or exact wire overhead.
+
+## Monitor the service
+
+Use **Overview** for current status and **Activity** for admin changes.
+Recent device observations and connection counters reset on restart; saved
+policies, settings, usage, and audit records persist.
+
+For automated monitoring, the private `/admin/metrics` endpoint provides
+Prometheus output and requires the admin credential. Follow the
+[API authentication instructions](API.md). Do not expose it through the
+public proxy.
+
+Set a webhook in **Settings** if you want monthly budget notifications.
+The events are `warning_75`, `warning_90`, and `exhausted`.
+Delivery failures do not disable traffic enforcement.
+
+## Back up
+
+Schedule a maintenance window: this simple, consistent backup stops the relay.
+It copies the entire state directory so SQLite's WAL files, if present, are
+not forgotten. The backup also contains secrets; keep it private.
+
+```sh
+WARDEN_BACKUP="/var/backups/relay-warden/$(date -u +%Y%m%dT%H%M%SZ)"
+sudo install -d -m 700 "$WARDEN_BACKUP"
+sudo systemctl stop relay-warden
+sudo cp -a /var/lib/relay-warden "$WARDEN_BACKUP/state"
+sudo cp -a /etc/relay-warden "$WARDEN_BACKUP/config"
+sudo cp -a /opt/relay-warden/relay-warden "$WARDEN_BACKUP/relay-warden"
+sudo systemctl start relay-warden
+printf 'Backup: %s\n' "$WARDEN_BACKUP"
+```
+
+Check each copy succeeds before restarting. Store a protected copy off the
+server too. A running database needs a proper SQLite online backup, not a
+plain copy of `warden.db` alone.
 
 ## Upgrade
 
-1. Snapshot `warden.db` (recoverable backup of the exact files replaced).
-2. Stop the service (`systemctl stop`: SIGTERM drains connections and
-   confirms ledger persistence, bounded by `TimeoutStopSec=30`), replace the
-   binary, restart.
-3. Check `/admin/status` (`db_ok`, period, exhaustion) and relay transfer.
+1. Download and verify the new archive using
+   [installation step 1](INSTALL.md#1-download-a-release).
+2. Read its release notes for configuration or schema changes.
+3. Make a backup as above. Keep the current database and tokens.
+4. From the **new archive directory**, replace only the executable:
 
-## Rollback (binary only — never restore an old database over a live ledger)
+```sh
+sudo systemctl stop relay-warden
+sudo install -m 755 ./relay-warden /opt/relay-warden/relay-warden
+sudo systemctl start relay-warden
+sudo systemctl status relay-warden --no-pager
+curl --fail http://127.0.0.1:8080/healthz
+```
 
-Restoring a pre-upgrade DB snapshot would delete usage recorded since the
-snapshot and resurrect spent allowance, contradicting the durability
-guarantee. Roll back the **binary only** and keep the current database:
+If an install command fails, keep the service stopped until you resolve it.
+Do not copy the example config over your existing config. Review service or
+proxy changes separately rather than replacing them blindly.
 
-1. `systemctl stop relay-warden`.
-2. Reinstall the previous release binary (keep a copy of each deployed
-   binary with its version).
-3. Start and verify: `/admin/usage` must show the same `charged_bytes` and
-   `exhausted` state as before the rollback.
-4. If the old binary refuses to start with `database schema generation …
-   is newer`, the schema moved forward: do **not** force the old database
-   back. Reinstall a binary that supports the current schema and fix forward.
-   There is no supported database downgrade or automatic ledger merge.
-   Merging only usage would also miss approvals, revoked endpoints, settings,
-   and schema changes. Keep the service stopped if the current ledger is lost
-   or cannot be read; a stale backup is not proof of remaining allowance.
-   Never fall back to an unrestricted relay binary: a failed custom server
-   stays down, loud, rather than silently open.
+Sign in again. Check the current month, usage, access mode, and settings, then
+perform a relayed transfer. The systemd unit gives graceful shutdown up to
+30 seconds to drain connections and persist the ledger.
 
-## Monitoring and alerts
+## Roll back the executable
 
-- Scrape the private `GET /admin/metrics` (Prometheus format, authenticated)
-  with existing tooling; dashboard optional. Enforcement never depends on
-  scraping.
-- Set `alert_webhook_url` (config or `PATCH /admin/settings`) to receive
-  `warning_75`, `warning_90`, `exhausted` POSTs. Each kind fires once per
-  period; failures are recorded in `usage.alerts.last_delivery` and never
-  affect enforcement. No sink = flags persist silently.
-- Exhaustion response: confirm `exhausted: true` in `/admin/usage`, decide
-  whether to re-budget (audited) or wait for the month boundary. Total-VPS
-  egress (including other services) must be watched separately at the
-  infrastructure layer.
+If an upgrade fails, restore the previous executable **without restoring its
+old database**. Use the path printed by your backup command:
 
-## Resource notes
+```sh
+WARDEN_BACKUP='/var/backups/relay-warden/PASTE_YOUR_BACKUP_DIRECTORY'
+sudo systemctl stop relay-warden
+sudo install -m 755 "$WARDEN_BACKUP/relay-warden" /opt/relay-warden/relay-warden
+sudo systemctl start relay-warden
+sudo journalctl -u relay-warden -n 50 --no-pager
+```
 
-Default ceilings: 1024 global connections, 16 per endpoint, 64 concurrent
-handshakes, 10s handshake timeout, 64KiB admin bodies. Tune in config.
-Metrics use fixed label sets (no endpoint IDs/IPs). Logs carry no payloads,
-tokens, or secrets; set verbosity with `RUST_LOG`.
+Check that charged usage has not decreased. If the old executable refuses a
+newer database schema, reinstall a compatible executable and fix forward.
+Do not hand-edit the schema version or restore stale usage to force it open.
+
+## Recover from a lost database
+
+Keep the relay stopped. A backup may omit traffic used since it was taken
+and may restore access you later revoked. There is no automatic ledger merge
+or supported database downgrade.
+
+Before reopening, reconcile the backup with provider traffic records and your
+allocation, reduce remaining allowance conservatively, and recheck access
+policies. If you cannot establish remaining allowance, leave the service
+stopped rather than treating old usage as current.
+
+## Share the server with other apps
+
+The supplied systemd unit caps the relay at 1 GB of memory, one CPU's worth
+of CPU time, and 256 tasks. These are ceilings, not reserved resources or
+measured requirements. Adjust them to your host.
+
+Global speeds live in `[network]`. Set them with room for your other services,
+and keep administration on loopback. Caddy/Nginx can route other hostnames
+through the same HTTPS edge without moving the relay's private listeners.

@@ -32,6 +32,17 @@ pub struct Config {
     /// Path to file containing the high-entropy admin token (restricted 0600).
     #[serde(default = "default_admin_token_file")]
     pub admin_token_file: String,
+    /// Require explicit endpoint approval. Disable deliberately for token-only
+    /// or public access; explicitly revoked records remain denied.
+    #[serde(default)]
+    pub require_endpoint_approval: bool,
+    /// Source-network abuse controls, independent of access policy.
+    #[serde(default)]
+    pub network: crate::network::NetworkConfig,
+    /// Optional private file containing a relay-access token (not admin token).
+    /// When set, every relay client must present it through Iroh token support.
+    #[serde(default)]
+    pub relay_token_file: Option<String>,
     /// Ordinary-endpoint default limits (bytes/sec). Required in production
     /// unless `require_default_limits` is explicitly disabled (tests/dev).
     #[serde(default)]
@@ -114,6 +125,9 @@ impl Default for Config {
             db_path: default_db(),
             admin_listen: default_admin_listen(),
             admin_token_file: default_admin_token_file(),
+            require_endpoint_approval: false,
+            network: crate::network::NetworkConfig::default(),
+            relay_token_file: None,
             default_rx_bps: None,
             default_tx_bps: None,
             require_default_limits: default_require_limits(),
@@ -132,6 +146,7 @@ impl Default for Config {
 impl Config {
     /// Minimal validation for fail-fast startup (Gate A).
     pub fn validate(&self) -> Result<(), String> {
+        self.network.validate()?;
         if self.max_handshake_concurrency == 0 {
             return Err("max_handshake_concurrency must be > 0".into());
         }
@@ -146,6 +161,13 @@ impl Config {
         }
         if self.admin_token_file.is_empty() {
             return Err("admin_token_file must not be empty".into());
+        }
+        if let Some(path) = &self.relay_token_file {
+            if path.is_empty() || path == &self.admin_token_file {
+                return Err(
+                    "relay_token_file must be nonempty and separate from admin_token_file".into(),
+                );
+            }
         }
         for (name, v) in [
             ("default_rx_bps", self.default_rx_bps),

@@ -1,4 +1,4 @@
-//! relay-warden: private Iroh relay library.
+//! relay-warden: policy-aware, self-hosted Iroh relay library.
 //!
 //! Axum frontend embedding public `iroh-relay` APIs, with SQLite-backed
 //! endpoint policy and live revocation, a private admin API, shared
@@ -8,8 +8,10 @@
 
 pub mod access;
 pub mod admin;
+pub mod admission;
 pub mod config;
 pub mod limiter;
+pub mod network;
 pub mod policy;
 pub mod quota;
 pub mod relay;

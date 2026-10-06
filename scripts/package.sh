@@ -33,7 +33,11 @@ cp deploy/config.production.example.toml "$STAGE/$NAME/warden.example.toml"
 cp deploy/relay-warden.service deploy/caddy.example deploy/nginx.example "$STAGE/$NAME/"
 printf '# Installation\n\nFollow [the installation guide](docs/INSTALL.md) included in this archive.\n' > "$STAGE/$NAME/INSTALL.md"
 mkdir -p "$STAGE/$NAME/docs"
-cp docs/INSTALL.md docs/OPERATIONS.md docs/CONFIGURATION.md docs/API.md "$STAGE/$NAME/docs/"
+cp docs/INSTALL.md docs/USAGE.md docs/OPERATIONS.md docs/CONFIGURATION.md docs/API.md docs/ARCHITECTURE.md "$STAGE/$NAME/docs/"
+mkdir -p "$STAGE/$NAME/docs/images"
+cp docs/images/deployment.svg "$STAGE/$NAME/docs/images/"
+printf '# Relay Warden\n\n[Deploy](docs/INSTALL.md) → [Use the dashboard](docs/USAGE.md) → [Maintain](docs/OPERATIONS.md)\n\n[Project documentation](https://github.com/sudosylabs/relay-warden#readme) · [Security policy](SECURITY.md)\n' > "$STAGE/$NAME/README.md"
+cp SECURITY.md CODE_OF_CONDUCT.md "$STAGE/$NAME/"
 python3 - "$VERSION" "$TARGET" "$STAGE/$NAME/BUILD.json" <<'PY'
 import json, platform, subprocess, sys
 version, target, output = sys.argv[1:]

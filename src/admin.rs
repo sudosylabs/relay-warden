@@ -46,6 +46,7 @@ pub struct AdminState {
     sessions: Arc<tokio::sync::Mutex<HashMap<String, Session>>>,
     login_attempts: Arc<tokio::sync::Mutex<HashMap<String, (usize, Instant)>>>,
     started: Instant,
+    network: Option<Arc<crate::network::NetworkGuard>>,
 }
 
 impl AdminState {
@@ -62,7 +63,13 @@ impl AdminState {
             sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             login_attempts: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             started: Instant::now(),
+            network: None,
         }
+    }
+
+    pub fn with_network(mut self, network: Arc<crate::network::NetworkGuard>) -> Self {
+        self.network = Some(network);
+        self
     }
 }
 
@@ -142,29 +149,16 @@ async fn check_auth(
     }
     Err(StatusCode::UNAUTHORIZED)
 }
-
 fn origin_allowed(origin: &str, host: Option<&str>) -> bool {
-    // Allow loopback origins always (SSH-tunnel local UI).
-    for prefix in [
-        "http://127.0.0.1",
-        "http://localhost",
-        "http://[::1]",
-        "https://127.0.0.1",
-        "https://localhost",
-    ] {
-        if origin.starts_with(prefix) {
-            return true;
-        }
+    let Ok(uri) = origin.parse::<http::Uri>() else {
+        return false;
+    };
+    if !matches!(uri.scheme_str(), Some("http" | "https")) {
+        return false;
     }
-    // Otherwise require same-host.
-    if let (Some(h), Ok(o)) = (host, origin.parse::<http::Uri>()) {
-        if let Some(oh) = o.host() {
-            // Compare host part of Host header (strip port).
-            let h_host = h.split(':').next().unwrap_or(h);
-            return oh == h_host;
-        }
-    }
-    false
+    uri.authority()
+        .zip(host)
+        .is_some_and(|(a, h)| a.as_str().eq_ignore_ascii_case(h))
 }
 
 impl AdminState {
@@ -183,6 +177,12 @@ fn json_err(status: StatusCode, msg: &str) -> Response {
 pub fn router(state: AdminState) -> Router {
     Router::new()
         .route("/admin/", get(ui_handler))
+        .route("/admin/admin.css", get(css_handler))
+        .route("/admin/admin.js", get(js_handler))
+        .route("/admin/navigation.js", get(navigation_handler))
+        .route("/admin/session", get(session_handler))
+        .route("/admin/pending", get(pending_handler))
+        .route("/admin/pending/{id}/dismiss", post(dismiss_handler))
         .route("/admin/login", post(login_handler))
         .route("/admin/logout", post(logout_handler))
         .route("/admin/endpoints", get(list_handler))
@@ -198,180 +198,158 @@ pub fn router(state: AdminState) -> Router {
         .route("/admin/metrics", get(metrics_handler))
         // Bound admin request bodies (labels live in JSON bodies, never URLs).
         .layer(tower_http::limit::RequestBodyLimitLayer::new(64 * 1024))
+        .layer(axum::middleware::map_response(|mut response: Response| async move {
+            let h = response.headers_mut();
+            h.insert("cache-control", "no-store".parse().unwrap());
+            h.insert("x-content-type-options", "nosniff".parse().unwrap());
+            h.insert("content-security-policy", "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'".parse().unwrap());
+            response
+        }))
         .with_state(state)
 }
 
 async fn ui_handler() -> Html<&'static str> {
-    // Static shell; all data loads via the authenticated API. Every dynamic
-    // string is injected with textContent (never innerHTML).
-    Html(
-        r#"<!doctype html><html><head><meta charset="utf-8"><title>relay-warden admin</title>
-<style>body{font-family:sans-serif;max-width:72em;margin:2em}table{border-collapse:collapse}td,th{border:1px solid #999;padding:.3em .6em;font-size:.9em}input,select{max-width:14em}.row-form input{width:9em}</style>
-</head>
-<body><h1>relay-warden admin</h1>
-<p>Private interface. Log in with the admin token (stored only in your secret file).</p>
-<div><input id="tok" type="password" placeholder="admin token" autocomplete="off">
-<button id="loginBtn">Login</button> <button id="logoutBtn">Logout</button></div>
-<pre id="out">not logged in</pre>
-<h2>Add endpoint</h2>
-<div><input id="newId" placeholder="endpoint id (hex or base32)" size="70">
-<input id="newLabel" placeholder="label">
-<button id="addBtn">Add (unapproved)</button></div>
-<h2>Endpoints</h2><div id="eps"></div>
-<h2>Monthly budget</h2><pre id="usage"></pre>
-<h2>Settings</h2><div id="settings"></div>
-<h2>Recent admin events</h2><div id="audit"></div>
-<script>
-"use strict";
-let csrf = null;
-function headers(extra) {
-  const h = {'Content-Type': 'application/json'};
-  if (csrf) h['X-CSRF-Token'] = csrf;
-  return Object.assign(h, extra || {});
+    Html(include_str!("../web/admin.html"))
 }
-function msg(t) { document.getElementById('out').textContent = t; }
-function td(text) { const c = document.createElement('td'); c.textContent = text; return c; }
-function numInput(id, val) {
-  const i = document.createElement('input'); i.id = id; i.type = 'number'; i.min = '0';
-  if (val !== null && val !== undefined) i.value = val;
-  return i;
-}
-async function api(path, opts) {
-  const r = await fetch(path, opts);
-  let j = null;
-  try { j = await r.json(); } catch (e) { /* non-JSON error page */ }
-  return {ok: r.ok, status: r.status, body: j};
-}
-async function login() {
-  const token = document.getElementById('tok').value;
-  const r = await api('login', {method: 'POST', headers: headers(), body: JSON.stringify({token: token})});
-  if (r.ok) { csrf = r.body.csrf; msg('logged in'); refresh(); }
-  else msg('login failed: ' + ((r.body && r.body.error) || r.status));
-  document.getElementById('tok').value = '';
-}
-async function logout() {
-  await api('logout', {method: 'POST', headers: headers()});
-  csrf = null; msg('logged out');
-}
-async function refresh() {
-  await Promise.all([refreshEndpoints(), refreshUsage(), refreshSettings(), refreshAudit()]);
-}
-async function refreshEndpoints() {
-  const div = document.getElementById('eps'); div.textContent = '';
-  const r = await api('endpoints', {headers: headers()});
-  if (!r.ok) { div.textContent = 'error: ' + ((r.body && r.body.error) || r.status); return; }
-  const table = document.createElement('table');
-  const head = document.createElement('tr');
-  ['endpoint', 'label', 'approved', 'speed', 'rx', 'tx', 'burst', 'rev', 'live', 'limits', ''].forEach(function(k) {
-    const th = document.createElement('th'); th.textContent = k; head.appendChild(th);
-  });
-  table.appendChild(head);
-  r.body.endpoints.forEach(function(e) {
-    const tr = document.createElement('tr');
-    tr.appendChild(td(e.endpoint_id));
-    const lab = document.createElement('input'); lab.value = e.label || '';
-    const labTd = document.createElement('td'); labTd.appendChild(lab); tr.appendChild(labTd);
-    const app = document.createElement('input'); app.type = 'checkbox'; app.checked = !!e.approved;
-    const appTd = document.createElement('td'); appTd.appendChild(app); tr.appendChild(appTd);
-    const spd = document.createElement('select');
-    ['default', 'custom', 'unlimited'].forEach(function(o) {
-      const op = document.createElement('option'); op.value = o; op.textContent = o;
-      if (e.speed_policy === o) op.selected = true;
-      spd.appendChild(op);
-    });
-    const spdTd = document.createElement('td'); spdTd.appendChild(spd); tr.appendChild(spdTd);
-    const rx = numInput(null, e.custom_rx_bps); const rxTd = document.createElement('td'); rxTd.appendChild(rx); tr.appendChild(rxTd);
-    const tx = numInput(null, e.custom_tx_bps); const txTd = document.createElement('td'); txTd.appendChild(tx); tr.appendChild(txTd);
-    const bu = numInput(null, e.burst_bytes); const buTd = document.createElement('td'); buTd.appendChild(bu); tr.appendChild(buTd);
-    tr.appendChild(td(String(e.revision)));
-    tr.appendChild(td('live=' + (e.live_connections == null ? 0 : e.live_connections)));
-    const lim = (e.limits && e.limits.rx_bps != null) ? (e.limits.rx_bps + '/' + e.limits.tx_bps) : 'unlimited';
-    tr.appendChild(td(lim));
-    const btnTd = document.createElement('td');
-    const save = document.createElement('button'); save.textContent = 'Save';
-    save.onclick = async function() {
-      const body = {revision: e.revision, label: lab.value, approved: app.checked, speed_policy: spd.value,
-        custom_rx_bps: rx.value === '' ? null : Number(rx.value),
-        custom_tx_bps: tx.value === '' ? null : Number(tx.value),
-        burst_bytes: bu.value === '' ? null : Number(bu.value)};
-      const r2 = await api('endpoints/' + encodeURIComponent(e.endpoint_id),
-        {method: 'PUT', headers: headers(), body: JSON.stringify(body)});
-      msg(r2.ok ? 'saved ' + e.endpoint_id : 'save failed: ' + ((r2.body && r2.body.error) || r2.status));
-      refreshEndpoints();
-    };
-    const revoke = document.createElement('button'); revoke.textContent = 'Revoke';
-    revoke.onclick = async function() {
-      const r2 = await api('endpoints/' + encodeURIComponent(e.endpoint_id) + '/revoke',
-        {method: 'POST', headers: headers()});
-      msg(r2.ok ? 'revoked' : 'revoke failed: ' + ((r2.body && r2.body.error) || r2.status));
-      refreshEndpoints();
-    };
-    btnTd.appendChild(save); btnTd.appendChild(revoke); tr.appendChild(btnTd);
-    table.appendChild(tr);
-  });
-  div.appendChild(table);
-}
-async function addEndpoint() {
-  const id = document.getElementById('newId').value.trim();
-  const label = document.getElementById('newLabel').value;
-  const r = await api('endpoints/' + encodeURIComponent(id),
-    {method: 'PUT', headers: headers(), body: JSON.stringify({label: label})});
-  msg(r.ok ? 'added (unapproved)' : 'add failed: ' + ((r.body && r.body.error) || r.status));
-  refreshEndpoints();
-}
-async function refreshUsage() {
-  const r = await api('usage', {headers: headers()});
-  document.getElementById('usage').textContent = r.ok ? JSON.stringify(r.body, null, 1) : ('error: ' + ((r.body && r.body.error) || r.status));
-}
-async function refreshSettings() {
-  const div = document.getElementById('settings'); div.textContent = '';
-  const r = await api('settings', {headers: headers()});
-  if (!r.ok) { div.textContent = 'error: ' + ((r.body && r.body.error) || r.status); return; }
-  const keys = ['default_rx_bps', 'default_tx_bps', 'quota_budget_bytes', 'quota_headroom_bytes',
-    'quota_overhead_pct', 'quota_chunk_bytes', 'alert_webhook_url'];
-  const inputs = {};
-  keys.forEach(function(k) {
-    const lab = document.createElement('label'); lab.textContent = k + ': ';
-    const inp = document.createElement('input');
-    const v = r.body.settings[k];
-    inp.value = (v === null || v === undefined) ? '' : v;
-    if (k === 'alert_webhook_url') inp.size = 50;
-    inputs[k] = inp; lab.appendChild(inp); div.appendChild(lab); div.appendChild(document.createElement('br'));
-  });
-  const save = document.createElement('button'); save.textContent = 'Save settings';
-  save.onclick = async function() {
-    const patch = {};
-    keys.forEach(function(k) {
-      const raw = inputs[k].value;
-      if (raw === '') { patch[k] = null; return; }
-      patch[k] = (k === 'alert_webhook_url') ? raw : Number(raw);
-    });
-    const r2 = await api('settings',
-      {method: 'PATCH', headers: headers(), body: JSON.stringify({version: r.body.version, settings: patch})});
-    msg(r2.ok ? 'settings saved' : 'settings failed: ' + ((r2.body && r2.body.error) || r2.status));
-    refreshSettings();
-  };
-  div.appendChild(save);
-  const ver = document.createElement('span'); ver.textContent = ' (version ' + r.body.version + ')';
-  div.appendChild(ver);
-}
-async function refreshAudit() {
-  const div = document.getElementById('audit'); div.textContent = '';
-  const r = await api('audit?limit=20', {headers: headers()});
-  if (!r.ok) { div.textContent = 'error: ' + ((r.body && r.body.error) || r.status); return; }
-  const table = document.createElement('table');
-  r.body.events.forEach(function(ev) {
-    const tr = document.createElement('tr');
-    [ev.at, ev.actor, ev.action, ev.target].forEach(function(x) { tr.appendChild(td(x || '')); });
-    table.appendChild(tr);
-  });
-  div.appendChild(table);
-}
-document.getElementById('loginBtn').onclick = login;
-document.getElementById('logoutBtn').onclick = logout;
-document.getElementById('addBtn').onclick = addEndpoint;
-</script></body></html>"#,
+
+async fn css_handler() -> impl IntoResponse {
+    (
+        [(CONTENT_TYPE, "text/css; charset=utf-8")],
+        include_str!("../web/admin.css"),
     )
+}
+
+async fn js_handler() -> impl IntoResponse {
+    (
+        [(CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        include_str!("../web/admin.js"),
+    )
+}
+
+async fn navigation_handler() -> impl IntoResponse {
+    (
+        [(CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        include_str!("../web/navigation.mjs"),
+    )
+}
+
+async fn session_handler(State(state): State<AdminState>, headers: HeaderMap) -> Response {
+    let cookies = parse_cookies(&headers);
+    let mut sessions = state.sessions.lock().await;
+    sessions.retain(|_, s| s.expires > Instant::now());
+    match cookies.get(SESSION_COOKIE).and_then(|id| sessions.get(id)) {
+        Some(session) => axum::Json(serde_json::json!({
+            "authenticated": true, "csrf": session.csrf,
+            "expires_in_secs": session.expires.saturating_duration_since(Instant::now()).as_secs()
+        }))
+        .into_response(),
+        None => json_err(StatusCode::UNAUTHORIZED, "session expired"),
+    }
+}
+
+#[derive(serde::Deserialize, Default)]
+struct ListQuery {
+    page: Option<usize>,
+    limit: Option<usize>,
+    #[serde(default)]
+    q: String,
+}
+
+#[derive(serde::Serialize)]
+struct Pagination {
+    page: usize,
+    page_size: usize,
+    total: usize,
+    total_pages: usize,
+}
+
+impl ListQuery {
+    fn request(&self) -> Result<Option<PageRequest>, &'static str> {
+        let Some(page) = self.page else {
+            return Ok(None);
+        };
+        let size = self.limit.unwrap_or(20);
+        if page == 0 || size == 0 {
+            return Err("page and limit must be positive");
+        }
+        Ok(Some(PageRequest {
+            page,
+            size: size.min(200),
+        }))
+    }
+
+    fn bounds(&self, total: usize) -> Result<Option<Pagination>, &'static str> {
+        Ok(self.request()?.map(|r| r.bounds(total)))
+    }
+}
+
+struct PageRequest {
+    page: usize,
+    size: usize,
+}
+impl PageRequest {
+    fn bounds(&self, total: usize) -> Pagination {
+        let total_pages = total.div_ceil(self.size).max(1);
+        Pagination {
+            page: self.page.min(total_pages),
+            page_size: self.size,
+            total,
+            total_pages,
+        }
+    }
+}
+
+fn page_rows<T>(rows: Vec<T>, page: &Option<Pagination>) -> Vec<T> {
+    match page {
+        Some(p) => rows
+            .into_iter()
+            .skip((p.page - 1) * p.page_size)
+            .take(p.page_size)
+            .collect(),
+        None => rows,
+    }
+}
+
+async fn pending_handler(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Query(query): Query<ListQuery>,
+) -> Response {
+    if check_auth(&state, &headers, false, None).await.is_err() {
+        return json_err(StatusCode::UNAUTHORIZED, "unauthorized");
+    }
+    let approval = state.app.policy.access_summary()["approval_required"]
+        .as_bool()
+        .unwrap_or(true);
+    let rows = if approval {
+        state.app.policy.pending()
+    } else {
+        state.app.policy.observed_unknown()
+    };
+    let page = match query.bounds(rows.len()) {
+        Ok(p) => p,
+        Err(e) => return json_err(StatusCode::BAD_REQUEST, e),
+    };
+    axum::Json(serde_json::json!({"requests": page_rows(rows, &page), "pagination": page, "mode": if approval {"requests"} else {"observed"}}))
+        .into_response()
+}
+
+async fn dismiss_handler(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    let host = headers.get("host").and_then(|v| v.to_str().ok());
+    if let Err(s) = check_auth(&state, &headers, true, host).await {
+        return json_err(s, "unauthorized");
+    }
+    match state.app.policy.dismiss_pending(&id) {
+        Ok(()) => {
+            state.audit("pending_dismiss", &id).await;
+            axum::Json(serde_json::json!({"ok": true})).into_response()
+        }
+        Err(e) => json_err(StatusCode::BAD_REQUEST, &e),
+    }
 }
 #[derive(serde::Deserialize)]
 struct LoginBody {
@@ -397,7 +375,11 @@ async fn login_handler(
         }
         entry.0 += 1;
     }
-    let _ = headers; // no auth needed for login itself
+    if let Some(origin) = headers.get("origin").and_then(|v| v.to_str().ok()) {
+        if !origin_allowed(origin, headers.get("host").and_then(|v| v.to_str().ok())) {
+            return json_err(StatusCode::FORBIDDEN, "forbidden origin");
+        }
+    }
     if !bearer_valid(body.token.trim(), &state.token) {
         state.audit("login_failed", "").await;
         return json_err(StatusCode::UNAUTHORIZED, "invalid token");
@@ -410,13 +392,19 @@ async fn login_handler(
         .remove(&addr.ip().to_string());
     let sid = random_token();
     let csrf = random_token();
-    state.sessions.lock().await.insert(
+    let mut sessions = state.sessions.lock().await;
+    sessions.retain(|_, s| s.expires > Instant::now());
+    if sessions.len() >= 256 {
+        return json_err(StatusCode::TOO_MANY_REQUESTS, "too many active sessions");
+    }
+    sessions.insert(
         sid.clone(),
         Session {
             csrf: csrf.clone(),
             expires: Instant::now() + SESSION_TTL,
         },
     );
+    drop(sessions);
     state.audit("login", "").await;
     let cookie =
         format!("{SESSION_COOKIE}={sid}; Path=/admin; HttpOnly; SameSite=Lax; Max-Age=3600");
@@ -429,6 +417,10 @@ async fn login_handler(
 }
 
 async fn logout_handler(State(state): State<AdminState>, headers: HeaderMap) -> Response {
+    let host = headers.get("host").and_then(|v| v.to_str().ok());
+    if let Err(s) = check_auth(&state, &headers, true, host).await {
+        return json_err(s, "unauthorized");
+    }
     let cookies = parse_cookies(&headers);
     if let Some(sid) = cookies.get(SESSION_COOKIE) {
         state.sessions.lock().await.remove(sid);
@@ -445,15 +437,41 @@ async fn logout_handler(State(state): State<AdminState>, headers: HeaderMap) -> 
         .into_response()
 }
 
-async fn list_handler(State(state): State<AdminState>, headers: HeaderMap) -> Response {
+async fn list_handler(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Query(query): Query<ListQuery>,
+) -> Response {
     if check_auth(&state, &headers, false, None).await.is_err() {
         return json_err(StatusCode::UNAUTHORIZED, "unauthorized");
     }
     let mut out = Vec::new();
-    for e in state.app.policy.list() {
+    let search = query.q.trim().to_lowercase();
+    let rows: Vec<_> = state
+        .app
+        .policy
+        .list()
+        .into_iter()
+        .filter(|e| {
+            format!("{} {}", e.label, e.endpoint_id)
+                .to_lowercase()
+                .contains(&search)
+        })
+        .collect();
+    let page = match query.bounds(rows.len()) {
+        Ok(p) => p,
+        Err(e) => return json_err(StatusCode::BAD_REQUEST, e),
+    };
+    for e in page_rows(rows, &page) {
         let live = state.app.policy.live_count(&e.endpoint_id);
         let mut v = serde_json::to_value(&e).unwrap_or_default();
         v["live_connections"] = live.into();
+        v["observation"] =
+            serde_json::to_value(state.app.policy.observation(&e.endpoint_id)).unwrap_or_default();
+        let effective =
+            crate::limiter::resolve_effective(Some(&e), &state.app.policy.defaults_snapshot());
+        v["effective_limits"] =
+            serde_json::json!({"rx_bps": effective.rx_bps, "tx_bps": effective.tx_bps});
         // Escape label for any server-rendered context; JSON keeps raw too.
         v["label_escaped"] = escape_html(&e.label).into();
         // Effective limits + observed counters (Gate C). Directions state the
@@ -477,7 +495,7 @@ async fn list_handler(State(state): State<AdminState>, headers: HeaderMap) -> Re
         }
         out.push(v);
     }
-    axum::Json(serde_json::json!({ "endpoints": out })).into_response()
+    axum::Json(serde_json::json!({ "endpoints": out, "pagination": page })).into_response()
 }
 
 async fn upsert_handler(
@@ -571,6 +589,11 @@ async fn status_handler(State(state): State<AdminState>, headers: HeaderMap) -> 
         "db_ok": db_ok,
         "live_connections": state.app.policy.live_total(),
         "approved_endpoints": state.app.policy.approved_count(),
+        "access_policy": state.app.policy.access_summary(),
+        "pending_requests": state.app.policy.pending().len(),
+        "observed_devices": state.app.policy.observed_unknown().len(),
+        "network_limits": state.network.as_ref().map(|n| n.summary()),
+        "denied_token_total": state.app.policy.denied_token_total.load(std::sync::atomic::Ordering::Relaxed),
         "limited_endpoints": snap.len(),
         "rx_bytes": rx_bytes,
         "tx_bytes": tx_bytes,
@@ -782,6 +805,33 @@ async fn audit_handler(
         .and_then(|s| s.parse().ok())
         .unwrap_or(50)
         .clamp(1, 200);
+    if let Some(page) = q.get("page") {
+        let Ok(page) = page.parse::<usize>() else {
+            return json_err(StatusCode::BAD_REQUEST, "invalid page");
+        };
+        let limit = match q.get("limit").map(|s| s.parse::<usize>()).transpose() {
+            Ok(limit) => limit,
+            Err(_) => return json_err(StatusCode::BAD_REQUEST, "invalid limit"),
+        };
+        let request = match (ListQuery {
+            page: Some(page),
+            limit,
+            q: String::new(),
+        })
+        .request()
+        {
+            Ok(Some(request)) => request,
+            Err(e) => return json_err(StatusCode::BAD_REQUEST, e),
+            Ok(None) => unreachable!("page was supplied"),
+        };
+        return match state.app.store.audit_page(request.page, request.size).await {
+            Ok((events, total, _)) => {
+                axum::Json(serde_json::json!({"events":events,"pagination": request.bounds(total)}))
+                    .into_response()
+            }
+            Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, &e),
+        };
+    }
     match state.app.policy.store().recent_audit(limit).await {
         Ok(events) => axum::Json(serde_json::json!({ "events": events })).into_response(),
         Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, &e),

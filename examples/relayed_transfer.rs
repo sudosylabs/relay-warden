@@ -34,6 +34,12 @@ struct Args {
     /// File containing the admin bearer token (avoids secrets in process args)
     #[arg(long, requires = "admin")]
     admin_token_file: Option<std::path::PathBuf>,
+    /// File containing the separate relay-access token, when required
+    #[arg(long)]
+    relay_token_file: Option<std::path::PathBuf>,
+    /// Try connecting before waiting, so devices appear under Access requests
+    #[arg(long, conflicts_with = "admin")]
+    request_access: bool,
 }
 
 #[tokio::main]
@@ -42,6 +48,11 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let relay_url: RelayUrl = args.relay.parse()?;
     let tls = CaTlsConfig::default().client_config(default_provider())?;
+    let relay_token = args
+        .relay_token_file
+        .map(std::fs::read_to_string)
+        .transpose()?
+        .map(|s| s.trim().to_owned());
 
     let a_sk = SecretKey::generate();
     let a_id = a_sk.public();
@@ -75,22 +86,39 @@ async fn main() -> anyhow::Result<()> {
         }
         println!("approved via admin API");
     } else {
-        println!("Approve both IDs in the admin interface, then press Enter to connect.");
-        let mut line = String::new();
-        anyhow::ensure!(
-            std::io::stdin().read_line(&mut line)? > 0,
-            "approval confirmation required"
-        );
+        if args.request_access {
+            for sk in [a_sk.clone(), b_sk.clone()] {
+                let mut builder = ClientBuilder::new(relay_url.clone(), sk, DnsResolver::new())
+                    .tls_client_config(tls.clone());
+                if let Some(t) = &relay_token {
+                    builder = builder.auth_token(t);
+                }
+                match builder.connect().await {
+                    Ok(client) => { drop(client); println!("endpoint already has relay access"); }
+                    Err(_) => println!("connection refused; check Access requests (a valid relay token is required when enabled)"),
+                }
+            }
+        }
+        if args.request_access {
+            println!("If approval is required, approve both IDs in the admin interface. Press Enter to connect.");
+            let mut line = String::new();
+            anyhow::ensure!(
+                std::io::stdin().read_line(&mut line)? > 0,
+                "confirmation required"
+            );
+        }
     }
 
-    let mut a = ClientBuilder::new(relay_url.clone(), a_sk, DnsResolver::new())
-        .tls_client_config(tls.clone())
-        .connect()
-        .await?;
-    let mut b = ClientBuilder::new(relay_url, b_sk, DnsResolver::new())
-        .tls_client_config(tls)
-        .connect()
-        .await?;
+    let mut a_builder = ClientBuilder::new(relay_url.clone(), a_sk, DnsResolver::new())
+        .tls_client_config(tls.clone());
+    let mut b_builder =
+        ClientBuilder::new(relay_url, b_sk, DnsResolver::new()).tls_client_config(tls);
+    if let Some(t) = &relay_token {
+        a_builder = a_builder.auth_token(t);
+        b_builder = b_builder.auth_token(t);
+    }
+    let mut a = a_builder.connect().await?;
+    let mut b = b_builder.connect().await?;
 
     for (dst, word) in [(b_id, "hello"), (a_id, "howdy")] {
         let (tx, rx) = if dst == b_id {

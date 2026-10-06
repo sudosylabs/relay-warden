@@ -1,0 +1,334 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <meta name="color-scheme" content="light" />
+    <title>Relay Warden · Administration</title>
+    <link rel="stylesheet" href="/admin/admin.css" />
+    <script src="/admin/admin.js" type="module"></script>
+  </head>
+  <body>
+    <div id="loginView" class="login-layout">
+      <section class="login-panel" aria-labelledby="loginTitle">
+        <div class="brand">Relay Warden</div>
+        <h1 id="loginTitle">Sign in</h1>
+        <p>Relay administration</p>
+        <form id="loginForm">
+          <label for="tok">Admin token</label>
+          <input
+            id="tok"
+            name="token"
+            type="password"
+            required
+            autocomplete="current-password"
+            spellcheck="false"
+          />
+          <p class="help">
+            Use the token from your server’s admin token file. This is not the
+            token you share with relay clients.
+          </p>
+          <button id="loginBtn" type="submit" class="primary">Sign in</button>
+        </form>
+        <p id="loginMessage" role="status" aria-live="polite">
+          Checking your session…
+        </p>
+      </section>
+    </div>
+    <div id="dashboard" class="shell" hidden>
+      <aside class="sidebar">
+        <div class="brand">
+          <span>Relay Warden<small>Administration</small></span>
+        </div>
+        <nav aria-label="Administration">
+          <a href="#/overview" data-page="overview" aria-current="page">
+            Overview
+          </a>
+          <a href="#/requests" data-page="requests">
+            <span id="observationLabel">Access requests</span> <span id="requestCount" class="count">0</span>
+          </a>
+          <a href="#/devices" data-page="devices">Devices</a>
+          <a href="#/settings" data-page="settings">Settings</a>
+          <a href="#/activity" data-page="activity">Activity</a>
+        </nav>
+        <div class="sidebar-footer">
+          <button id="logoutBtn" type="button">Sign out</button>
+        </div>
+      </aside>
+      <main>
+        <header class="page-header">
+          <div>
+            <h1 id="pageTitle">Overview</h1>
+          </div>
+          <button id="refreshBtn" type="button">Refresh</button>
+        </header>
+        <p id="notice" role="status" aria-live="polite"></p>
+        <section id="overview" class="page" aria-label="Overview">
+          <div class="stats">
+            <article>
+              <span>Relay status</span><strong id="health">—</strong
+              ><small id="uptime">—</small>
+            </article>
+            <article>
+              <span>Live connections</span><strong id="connections">—</strong
+              ><small>Connections, not unique devices</small>
+            </article>
+            <article>
+              <span>Approved devices</span><strong id="approved">—</strong
+              ><small>Saved endpoint identities</small>
+            </article>
+          </div>
+          <article class="panel budget-panel">
+            <div class="section-heading">
+              <h2>Monthly budget</h2>
+              <span id="period" class="badge">—</span>
+            </div>
+            <div class="budget-total">
+              <strong id="charged">—</strong><span id="budget">—</span>
+            </div>
+            <progress
+              id="budgetProgress"
+              max="100"
+              value="0"
+              aria-label="Monthly relay budget used"
+            ></progress>
+            <div class="budget-detail">
+              <span id="remaining">—</span><span id="cutoff">—</span>
+            </div>
+            <p id="budgetNote" class="help"></p>
+          </article>
+          <article class="panel">
+            <h2>Access policy</h2>
+            <div id="accessSummary" class="policy-summary"></div>
+            <p id="networkSummary" class="help"></p>
+            <p class="help">
+              Speed exemptions never bypass an enabled monthly budget. Access
+              policy is configured on the server; changing it requires a
+              restart.
+            </p>
+          </article>
+          <div class="stats traffic">
+            <article>
+              <span>Received by relay</span><strong id="rx">—</strong
+              ><small>Current process · tracked devices</small>
+            </article>
+            <article>
+              <span>Sent by relay</span><strong id="tx">—</strong
+              ><small>Current process · tracked devices</small>
+            </article>
+            <article>
+              <span>Rejected attempts</span><strong id="denied">—</strong
+              ><small id="deniedDetail">—</small>
+            </article>
+          </div>
+        </section>
+        <section id="requests" class="page" hidden aria-label="Access requests">
+          <p class="intro">
+            <span id="observationIntro">Approve devices that tried to connect. Verify the endpoint
+            fingerprint with the person before granting access.</span>
+          </p>
+          <p id="pendingPolicy" class="help"></p>
+          <div id="requestList" class="device-list"></div>
+          <nav
+            id="requestsPagination"
+            class="pagination"
+            aria-label="Access requests pagination"
+          ></nav>
+          <p class="help">
+            Observations are kept for up to 24 hours, with a maximum of 1,000 recent
+            observations. They reset when the server restarts. Dismissing an
+            entry does not block future attempts.
+          </p>
+        </section>
+        <section id="devices" class="page" hidden aria-label="Devices">
+          <div class="section-heading">
+            <p class="intro">
+              Saved device identities and their traffic rules.
+            </p>
+            <button id="addBtn" type="button" class="primary">
+              Add endpoint
+            </button>
+          </div>
+          <label for="deviceSearch" class="search-label">Find a device</label
+          ><input
+            id="deviceSearch"
+            type="search"
+            placeholder="Name or endpoint ID"
+            class="search"
+          />
+          <div id="deviceList" class="device-list"></div>
+          <nav
+            id="devicesPagination"
+            class="pagination"
+            aria-label="Devices pagination"
+          ></nav>
+        </section>
+        <section id="settings" class="page" hidden aria-label="Settings">
+          <p class="intro">
+            Traffic controls apply independently of token authentication and
+            endpoint approval.
+          </p>
+          <form id="settingsForm" class="panel">
+            <h2>Default speed limits</h2>
+            <p class="help">
+              Applies to ordinary devices, including unsaved devices in public
+              or token-only mode. Directions are from the relay’s perspective.
+            </p>
+            <div class="form-grid">
+              <label
+                >Receive limit (bytes/s)<input
+                  name="default_rx_bps"
+                  type="number"
+                  min="1"
+                  max="100000000000"
+                  step="1" /></label
+              ><label
+                >Send limit (bytes/s)<input
+                  name="default_tx_bps"
+                  type="number"
+                  min="1"
+                  max="100000000000"
+                  step="1"
+              /></label>
+            </div>
+            <p class="help">
+              1,000,000 bytes/s = 1 MB/s. Empty removes the limit.
+            </p>
+            <h2>Monthly budget</h2>
+            <div class="form-grid">
+              <label
+                >Budget (bytes)<input
+                  name="quota_budget_bytes"
+                  type="number"
+                  min="1"
+                  step="1" /></label
+              ><label
+                >Safety headroom (bytes)<input
+                  name="quota_headroom_bytes"
+                  type="number"
+                  min="0"
+                  step="1" /></label
+              ><label
+                >Overhead allowance (%)<input
+                  name="quota_overhead_pct"
+                  type="number"
+                  min="0"
+                  max="100"
+                  step="1" /></label
+              ><label
+                >Reservation chunk (bytes)<input
+                  name="quota_chunk_bytes"
+                  type="number"
+                  min="1024"
+                  max="1048576"
+                  step="1"
+              /></label>
+            </div>
+            <p class="help">
+              6 TB = 6,000,000,000,000 bytes. The effective cutoff is budget
+              minus headroom. This is relay accounting, not your provider’s
+              billing meter.
+            </p>
+            <p id="quotaSettingsNote" class="help"></p>
+            <h2>Alerts</h2>
+            <label
+              >Webhook URL<input
+                name="alert_webhook_url"
+                type="url"
+                maxlength="512"
+                placeholder="https://…"
+            /></label>
+            <p class="help">
+              Optional destination for monthly budget alerts. Leave empty to
+              disable.
+            </p>
+            <button type="submit" class="primary">Save settings</button>
+          </form>
+        </section>
+        <section id="activity" class="page" hidden aria-label="Activity">
+          <p class="intro">
+            Recent administrator actions. Connection counters reset on restart;
+            this audit history is stored.
+          </p>
+          <div id="auditList" class="panel"></div>
+          <nav
+            id="activityPagination"
+            class="pagination"
+            aria-label="Activity pagination"
+          ></nav>
+        </section>
+      </main>
+    </div>
+    <dialog id="editor">
+      <form id="deviceForm">
+        <div class="section-heading">
+          <h2 id="editorTitle">Add endpoint</h2>
+          <button
+            type="button"
+            id="closeEditor"
+            aria-label="Close device editor"
+          >
+            ×
+          </button>
+        </div>
+        <label
+          >Endpoint ID<input
+            name="endpoint_id"
+            required
+            spellcheck="false"
+            autocomplete="off"
+        /></label>
+        <p class="help">
+          The public key identifying this device. Do not enter a secret key.
+        </p>
+        <label
+          >Device name<input
+            name="label"
+            maxlength="128"
+            autocomplete="off"
+            placeholder="For example, Alice’s laptop" /></label
+        ><label class="check"
+          ><input name="approved" type="checkbox" /> Allow this device</label
+        ><label
+          >Speed policy<select name="speed_policy">
+            <option value="default">Use default limits</option>
+            <option value="custom">Custom limits</option>
+            <option value="unlimited">Unlimited speed</option>
+          </select></label
+        >
+        <div id="customLimits" class="form-grid" hidden>
+          <label
+            >Receive (bytes/s)<input
+              name="custom_rx_bps"
+              type="number"
+              min="1"
+              max="100000000000" /></label
+          ><label
+            >Send (bytes/s)<input
+              name="custom_tx_bps"
+              type="number"
+              min="1"
+              max="100000000000"
+          /></label>
+          <p class="help">
+            At least one direction is required. An empty direction is unlimited.
+          </p>
+        </div>
+        <label
+          >Burst allowance (bytes)<input
+            name="burst_bytes"
+            type="number"
+            min="1"
+            max="1000000000"
+            placeholder="Automatic"
+        /></label>
+        <p class="help">
+          Unlimited speed still respects the monthly budget. Disallowed saved
+          devices are denied in every access mode.
+        </p>
+        <p id="editorMessage" role="status"></p>
+        <button type="submit" class="primary">Save device</button>
+      </form>
+    </dialog>
+  </body>
+</html>

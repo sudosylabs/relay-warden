@@ -4,7 +4,12 @@
 
 relay.example.com {
 	@iroh path /relay /ping
-	reverse_proxy @iroh 127.0.0.1:8080
+	handle @iroh {
+		reverse_proxy 127.0.0.1:8080
+	}
+	handle {
+		respond "Not found" 404
+	}
 	# Do not buffer relay WebSockets; preserve upgrade + subprotocol headers
 	# (Caddy passes Sec-WebSocket-Protocol through by default).
 }
